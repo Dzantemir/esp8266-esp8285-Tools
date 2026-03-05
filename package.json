@@ -1,20 +1,17 @@
 {
 	"name": "esp-idf-tools",
 	"displayName": "ESP8266 / ESP8285 Tools",
-	"description": "Convenient interface for working with ESP8266_RTOS_SDK (idf.py)",
+	"description": "Build, flash, monitor and configure ESP8266/ESP8285 projects. Supports ESP8266_RTOS_SDK (idf.py) and ESP8266_NonOS_SDK.",
 	"version": "1.8.7",
-	"publisher": "esp-community",
+	"publisher": "Dzantemir",
 	"engines": {
 		"vscode": "^1.75.0"
 	},
 	"categories": [
-		"Other"
+		"Other",
+		"Debuggers"
 	],
 	"icon": "media/icon.png",
-	"repository": {
-		"type": "git",
-		"url": "https://github.com/esp-community/esp-idf-tools"
-	},
 	"activationEvents": [
 		"workspaceContains:sdkconfig",
 		"workspaceContains:Makefile",
@@ -509,9 +506,30 @@
 			}
 		}
 	},
+	"keywords": [
+		"esp8266",
+		"esp8285",
+		"espressif",
+		"iot",
+		"idf",
+		"rtos",
+		"embedded",
+		"flash",
+		"serial",
+		"partition"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Dzantemir/esp8266-esp8285-Tools.git"
+	},
+	"bugs": {
+		"url": "https://github.com/Dzantemir/esp8266-esp8285-Tools/issues"
+	},
+	"homepage": "https://github.com/Dzantemir/esp8266-esp8285-Tools#readme",
 	"__metadata": {
-		"installedTimestamp": 1772701513056,
+		"installedTimestamp": 1772714927552,
 		"targetPlatform": "undefined",
-		"size": 168586
+		"size": 174907
 	}
 }
