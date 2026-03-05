@@ -12,6 +12,7 @@ Supports both **ESP8266_RTOS_SDK** (`idf.py`) and **ESP8266_NonOS_SDK** (`make`)
 - **Build App** — application only
 - **Build Bootloader** — bootloader only
 - **Build Partition Table** — partition table only
+- Auto-saves all unsaved files before build
 
 ### ⚡ Flash
 - **Flash** — flash firmware to device
@@ -29,14 +30,35 @@ Supports both **ESP8266_RTOS_SDK** (`idf.py`) and **ESP8266_NonOS_SDK** (`make`)
 - **Reconfigure** — re-run CMake configuration
 - **Reset Config** — delete sdkconfig and restore defaults
 
+### 📁 Project Folder
+- Shows active project name
+- **📦 Components** — automatically lists `components/` subfolders
+  - `[+]` button — launch **Add Component** wizard
+  - `[🗑]` button — delete component with confirmation
+
+### ➕ Add Component Wizard (RTOS SDK only)
+Creates a new ESP-IDF component in `components/` with 4 steps:
+1. Component name
+2. Source `.c` files
+3. Header location: `include/` folder, same folder `./`, or none
+4. `REQUIRES` dependencies
+
+Generates:
+- `components/<name>/CMakeLists.txt` with correct `idf_component_register()`
+- `.c` source stub
+- `.h` header stub (if selected)
+
+> No changes to root `CMakeLists.txt` needed — ESP-IDF SDK auto-detects `components/`
+
 ### 🗂️ Partition Table Editor
 Visual editor for ESP8266 flash partition tables:
 - Drag-and-drop partition reordering
 - Flash map visualization
 - **OTA preset** — auto-selects 1MB or 2MB+ layout based on flash size
-- **SPIFFS preset** — classic SPIFFS layout with large data partition
-- **Default preset** — standard single factory app layout
+- **SPIFFS preset** — classic layout: nvs + phy_init + factory (512KB) + spiffs (rest)
+- **Default preset** — standard single factory app (960KB max due to ESP8266 1MB boundary)
 - Auto Offsets — automatic offset calculation
+- Validation with ESP8266-specific checks (1MB app boundary, alignment, overlaps)
 - CSV save/open
 
 ### 🛠️ Utilities
