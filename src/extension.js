@@ -6,6 +6,10 @@ const fs     = require('fs');
 const os     = require('os');
 const cp     = require('child_process');
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HELPERS: State, Platform, Logging, Config, Path                   ║
+// ╚══════════════════════════════════════════════════════════════════╝
 // ─── Module-level state ───────────────────────────────────────────────────────
 let terms             = {};
 let activeRoot        = null;
@@ -142,6 +146,10 @@ function findXtensaGcc() {
     return '';
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HELPERS: Busy Lock                                                ║
+// ╚══════════════════════════════════════════════════════════════════╝
 // ─── Global busy lock ────────────────────────────────────────────────────────
 function setBusy(name) {
     _globalBusy     = true;
@@ -183,6 +191,10 @@ function checkBusy() {
 }
 
 // ─── Status bar ──────────────────────────────────────────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HELPERS: Status Bar                                               ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function createStatusBar(ctx) {
     _statusBarPort = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     _statusBarPort.command = 'esp.selectPort';
@@ -214,6 +226,10 @@ function refreshStatusBar() {
 }
 
 // ─── TreeItem ─────────────────────────────────────────────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  TREE VIEW: EspItem / EspGroup / EspProvider                       ║
+// ╚══════════════════════════════════════════════════════════════════╝
 class EspItem extends vscode.TreeItem {
     constructor(label, opts = {}) {
         super(label, vscode.TreeItemCollapsibleState.None);
@@ -265,8 +281,28 @@ class EspProvider {
                 icon:    root ? (folders.length > 1 ? 'folder-active' : 'folder') : 'error',
                 tooltip: root || 'Select project workspace folder',
                 desc:    root ? (folders.length > 1 ? 'click to change' : '') : 'click to select',
-            })
-        ]);
+            }),
+            ...( (() => {
+                if (!root) return [];
+                const compDir = path.join(root, 'components');
+                if (!fs.existsSync(compDir)) return [];
+                const comps = fs.readdirSync(compDir).filter(n =>
+                    fs.statSync(path.join(compDir, n)).isDirectory()
+                );
+                if (!comps.length) return [];
+                const compItems = comps.map(name => {
+                    const item = new EspItem(name, {
+                        icon: 'package',
+                        tooltip: `Component: ${name}\n${path.join(compDir, name)}`,
+                    });
+                    item.contextValue = 'componentItem';
+                    item._compName = name;
+                    return item;
+                });
+                return [ new EspGroup('componentsGroup', '📦  Components', compItems, undefined,
+                    vscode.TreeItemCollapsibleState.Expanded) ];
+            })() )
+        ], 'projectFolderGroup');
 
         const createProjectItem = new EspItem('Create New Project', {
             command: 'esp.createProject',
@@ -485,6 +521,10 @@ class EspProvider {
 }
 
 // ─── Terminal management ──────────────────────────────────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  TERMINAL & COMMAND EXECUTION                                      ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function getTerm(name) {
     const reuse = cfg('reuseTerminal');
     if (reuse && terms[name] && terms[name].exitStatus === undefined) {
@@ -629,6 +669,10 @@ function buildMarkerCmd(markerFile) {
 }
 
 // ─── NONOS SDK: run make command ─────────────────────────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  NONOS SDK: make / flash / monitor                                 ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function runMake(target, termName, isBuildCommand = false) {
     const root = getActiveRoot();
     if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
@@ -794,9 +838,18 @@ async function runNonosMonitor() {
 }
 
 // ─── Run idf.py (unified sendText on all platforms) ──────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  RTOS SDK: idf.py runner                                           ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {}) {
     const root = getActiveRoot();
     if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+
+    // Save all unsaved files before build commands
+    if (isBuildCommand) {
+        await vscode.workspace.saveAll(false);
+    }
 
     // Verify this is a valid ESP-IDF (RTOS) project
     if (!fs.existsSync(path.join(root, 'CMakeLists.txt')) && !fs.existsSync(path.join(root, 'sdkconfig'))) {
@@ -905,6 +958,10 @@ async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {})
     }
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  FLASH & MONITOR                                                   ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function buildEnvSetCmd(envObj) {
     const entries = Object.entries(envObj);
     if (!entries.length) return '';
@@ -1009,6 +1066,10 @@ function cmdStopMonitor() {
     }
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HOTPLUG: Port Detection                                           ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function checkAndInstallTools() {
     const idfPath = expandHome(cfg('idfPath'));
     if (!idfPath) return;
@@ -1144,6 +1205,10 @@ function stopHotplug() {
 }
 
 // ─── Activation ──────────────────────────────────────────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  ACTIVATION / DEACTIVATION                                         ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function activate(ctx) {
     globalCtx = ctx;
     const provider = new EspProvider();
@@ -1240,6 +1305,8 @@ function activate(ctx) {
     reg('esp.nonos.stopMonitor',  () => cmdStopMonitor());
 
     reg('esp.spiffs',          () => cmdMakeSpiffs());
+    reg('esp.addComponent',    async () => { await cmdAddComponent(); provider.refresh(); });
+    reg('esp.deleteComponent', async (item) => { await cmdDeleteComponent(item); provider.refresh(); });
     reg('esp.partitionEditor', () => cmdPartitionEditor());
     reg('esp.efuseCommon',     () => runIdf(['efuse_common_table'], 'ESP › eFuse Common Table'));
     reg('esp.efuseCustom',     () => runIdf(['efuse_custom_table'], 'ESP › eFuse Custom Table'));
@@ -1278,6 +1345,10 @@ function deactivate() {
     terms = {};
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  PROJECT SETUP: IntelliSense, Tasks, Auto-generate                 ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function autoGenerateDevFiles() {
     if (!cfg('autoGenerateOnOpen')) return;
 
@@ -1555,6 +1626,158 @@ async function cmdGenerateTasks() {
     }
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  COMPONENT MANAGEMENT: Add / Delete                                ║
+// ╚══════════════════════════════════════════════════════════════════╝
+async function cmdDeleteComponent(item) {
+    const root = getActiveRoot();
+    if (!root) return;
+
+    const compName = item?._compName || item?.label;
+    if (!compName) { vscode.window.showErrorMessage('ESP: Cannot determine component name.'); return; }
+
+    const compDir = path.join(root, 'components', compName);
+    if (!fs.existsSync(compDir)) {
+        vscode.window.showErrorMessage(`ESP: Component folder not found: ${compDir}`);
+        return;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+        `Delete component "${compName}"? This will remove the entire folder.`,
+        { modal: true },
+        'Delete'
+    );
+    if (choice !== 'Delete') return;
+
+    try {
+        fs.rmSync(compDir, { recursive: true, force: true });
+        vscode.window.showInformationMessage(`✅ Component "${compName}" deleted.`);
+    } catch (e) {
+        vscode.window.showErrorMessage(`ESP: Failed to delete component: ${e.message}`);
+    }
+}
+
+async function cmdAddComponent() {
+    const root = getActiveRoot();
+    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder first!'); return; }
+
+    // NonOS SDK uses make, not cmake — components not supported yet
+    if (getActiveSdkType() === 'nonos') {
+        vscode.window.showWarningMessage(
+            '⚠️ "Add Component" supports RTOS SDK (CMake) only. ' +
+            'For NonOS SDK — create component folders and Makefiles manually.'
+        );
+        return;
+    }
+
+    // Step 1 — component name
+    const compName = await vscode.window.showInputBox({
+        title:       'Add Component — Step 1/4: Component Name',
+        prompt:      'Name of the new component',
+        placeHolder: 'my_component',
+        validateInput: text => {
+            if (!text?.match(/^[a-zA-Z0-9_]+$/)) return 'Use letters, numbers and _ only';
+            if (fs.existsSync(path.join(root, 'components', text))) return 'Component already exists';
+            return null;
+        }
+    });
+    if (!compName) return;
+
+    // Step 2 — source files
+    const srcsInput = await vscode.window.showInputBox({
+        title:       'Add Component — Step 2/4: Source Files',
+        prompt:      'Source .c files (comma-separated)',
+        placeHolder: `${compName}.c`,
+        value:       `${compName}.c`,
+    });
+    if (srcsInput === undefined) return;
+    const srcs = srcsInput.split(',').map(s => s.trim()).filter(Boolean);
+
+    // Step 3 — headers
+    const headersChoice = await vscode.window.showQuickPick([
+        { label: '$(folder) Separate include/ folder', description: 'INCLUDE_DIRS "include"', value: 'include' },
+        { label: '$(file)   Same folder as .c files',  description: 'INCLUDE_DIRS "."',       value: 'dot'     },
+        { label: '$(x)      No header files',           description: 'no INCLUDE_DIRS',        value: 'none'    },
+    ], {
+        title: 'Add Component — Step 3/4: Header Files',
+        placeHolder: 'Where are the .h files?',
+    });
+    if (!headersChoice) return;
+
+    // Step 4 — REQUIRES
+    const reqInput = await vscode.window.showInputBox({
+        title:       'Add Component — Step 4/4: Dependencies (REQUIRES)',
+        prompt:      'Other components this depends on (comma-separated, leave empty if none)',
+        placeHolder: 'fatfs, driver',
+    });
+    if (reqInput === undefined) return;
+    const requires = reqInput.split(',').map(s => s.trim()).filter(Boolean);
+
+    // Build CMakeLists.txt content
+    const srcsLine    = srcs.map(s => `"${s}"`).join(' ');
+    const incLine     = headersChoice.value === 'include' ? '\n                       INCLUDE_DIRS "include"'
+                      : headersChoice.value === 'dot'     ? '\n                       INCLUDE_DIRS "."'
+                      : '';
+    const reqLine     = requires.length ? `\n                       REQUIRES ${requires.join(' ')}` : '';
+    const cmakeContent = `idf_component_register(SRCS ${srcsLine}${incLine}${reqLine}\n)\n`;
+
+    // Create folders and files
+    const compDir = path.join(root, 'components', compName);
+    try {
+        fs.mkdirSync(compDir, { recursive: true });
+        if (headersChoice.value === 'include') {
+            fs.mkdirSync(path.join(compDir, 'include'), { recursive: true });
+        }
+
+        // CMakeLists.txt
+        fs.writeFileSync(path.join(compDir, 'CMakeLists.txt'), cmakeContent);
+
+        // Source files
+        for (const src of srcs) {
+            const srcPath = path.join(compDir, src);
+            if (!fs.existsSync(srcPath)) {
+                const baseName = src.replace(/\.c$/, '');
+                fs.writeFileSync(srcPath,
+`#include "${baseName}.h"
+
+// TODO: implement ${baseName}
+`);
+            }
+        }
+
+        // Header files
+        if (headersChoice.value !== 'none') {
+            const headerDir = headersChoice.value === 'include'
+                ? path.join(compDir, 'include')
+                : compDir;
+            const headerPath = path.join(headerDir, `${compName}.h`);
+            if (!fs.existsSync(headerPath)) {
+                const guard = compName.toUpperCase() + '_H';
+                fs.writeFileSync(headerPath,
+`#ifndef ${guard}
+#define ${guard}
+
+// TODO: declare ${compName} API
+
+#endif // ${guard}
+`);
+            }
+        }
+
+        vscode.window.showInformationMessage(
+            `✅ Component "${compName}" created in components/${compName}/`
+        );
+
+    } catch (e) {
+        vscode.window.showErrorMessage(`ESP: Failed to create component: ${e.message}`);
+    }
+}
+
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  PROJECT CREATION WIZARD                                           ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function cmdCreateProject() {
     const activeSdk = getActiveSdkType();
     const sdkChoice = await vscode.window.showQuickPick([
@@ -1733,6 +1956,10 @@ output/
 `);
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  SETTINGS COMMANDS: Project, IDF, SDK, Port, Flash                 ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function cmdSelectProject() {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders?.length) { vscode.window.showErrorMessage('No open folders. Use File > Open Folder.'); return; }
@@ -2077,6 +2304,10 @@ function detectPortsMac() {
     });
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  UTILITIES: SPIFFS, Partition CSV, Reset Config                    ║
+// ╚══════════════════════════════════════════════════════════════════╝
 async function cmdMakeSpiffs() {
     const root = getActiveRoot();
     if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
@@ -2205,6 +2436,10 @@ async function cmdResetConfig() {
     log(`Reset Config: deleted ${deleted.join(', ')}`);
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  PARTITION TABLE EDITOR: Webview                                   ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function cmdPartitionEditor() {
     const root = getActiveRoot();
     if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
@@ -2505,7 +2740,10 @@ if (!partitions.length) resetDefault();
 render();
 
 function resetDefault() {
-  partitions =[
+  // ESP8266 hardware limit: app partition MUST NOT cross 1MB boundary.
+  // factory starts at 0x10000, so max size = 0x100000 - 0x10000 = 0xF0000 (960KB).
+  // Remaining flash (if any) is left free for user to add data partitions.
+  partitions = [
     { name:'nvs',      type:'data', subtype:'nvs',     offset:'0x9000',  size:'0x6000',  encrypted:false },
     { name:'phy_init', type:'data', subtype:'phy',     offset:'0xf000',  size:'0x1000',  encrypted:false },
     { name:'factory',  type:'app',  subtype:'factory', offset:'0x10000', size:'0xF0000', encrypted:false },
@@ -3117,6 +3355,10 @@ document.addEventListener('click', e => {
 </html>`;
 }
 
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  PARTITION TABLE EDITOR: CSV Parser                                ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function parseCsvToPartitions(csv) {
     if (!csv) return[];
     const partitions =[];
@@ -3138,6 +3380,10 @@ function parseCsvToPartitions(csv) {
     }
     return partitions;
 }
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  EXPORTS                                                           ║
+// ╚══════════════════════════════════════════════════════════════════╝
 function checkCommandExists(cmd) {
     return new Promise(resolve => {
         cp.exec(IS_WIN ? `where ${cmd}` : `command -v ${cmd}`, { timeout: 2000 }, e => resolve(!e));
