@@ -1,0 +1,517 @@
+{
+	"name": "esp-idf-tools",
+	"displayName": "ESP8266 / ESP8285 Tools",
+	"description": "Convenient interface for working with ESP8266_RTOS_SDK (idf.py)",
+	"version": "1.8.7",
+	"publisher": "esp-community",
+	"engines": {
+		"vscode": "^1.75.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"icon": "media/icon.png",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/esp-community/esp-idf-tools"
+	},
+	"activationEvents": [
+		"workspaceContains:sdkconfig",
+		"workspaceContains:Makefile",
+		"workspaceContains:CMakeLists.txt",
+		"onCommand:esp.build",
+		"onCommand:esp.flash",
+		"onCommand:esp.monitor",
+		"onCommand:esp.partitionEditor",
+		"onCommand:esp.createProject"
+	],
+	"main": "./src/extension.js",
+	"scripts": {
+		"build": "echo 'No build needed' && mkdir -p dist",
+		"lint": "echo 'No linting configured'"
+	},
+	"contributes": {
+		"problemMatchers": [
+			{
+				"name": "esp-idf-gcc",
+				"owner": "cpp",
+				"fileLocation": [
+					"relative",
+					"${workspaceFolder}"
+				],
+				"pattern": {
+					"regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+					"file": 1,
+					"line": 2,
+					"column": 3,
+					"severity": 4,
+					"message": 5
+				}
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "esp-idf-tools-explorer",
+					"title": "ESP-IDF",
+					"icon": "media/icon_mono.svg"
+				}
+			]
+		},
+		"views": {
+			"esp-idf-tools-explorer": [
+				{
+					"id": "esp-idf-tools.projectView",
+					"name": "Project & Commands",
+					"icon": "media/icon_mono.svg"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "esp.build",
+				"title": "ESP › Build"
+			},
+			{
+				"command": "esp.buildApp",
+				"title": "ESP › Build App"
+			},
+			{
+				"command": "esp.buildBootloader",
+				"title": "ESP › Build Bootloader"
+			},
+			{
+				"command": "esp.buildPartition",
+				"title": "ESP › Build Partition Table"
+			},
+			{
+				"command": "esp.size",
+				"title": "ESP › Size"
+			},
+			{
+				"command": "esp.sizeComponents",
+				"title": "ESP › Size Components"
+			},
+			{
+				"command": "esp.sizeFiles",
+				"title": "ESP › Size Files"
+			},
+			{
+				"command": "esp.menuconfig",
+				"title": "ESP › Menuconfig"
+			},
+			{
+				"command": "esp.reconfigure",
+				"title": "ESP › Reconfigure"
+			},
+			{
+				"command": "esp.clean",
+				"title": "ESP › Clean"
+			},
+			{
+				"command": "esp.fullclean",
+				"title": "ESP › Full Clean"
+			},
+			{
+				"command": "esp.flash",
+				"title": "ESP › Flash"
+			},
+			{
+				"command": "esp.monitor",
+				"title": "ESP › Monitor"
+			},
+			{
+				"command": "esp.flashMonitor",
+				"title": "ESP › Flash & Monitor"
+			},
+			{
+				"command": "esp.flashApp",
+				"title": "ESP › Flash App"
+			},
+			{
+				"command": "esp.flashBootloader",
+				"title": "ESP › Flash Bootloader"
+			},
+			{
+				"command": "esp.flashPartition",
+				"title": "ESP › Flash Partition Table"
+			},
+			{
+				"command": "esp.flashEncrypted",
+				"title": "ESP › Flash Encrypted"
+			},
+			{
+				"command": "esp.flashEncApp",
+				"title": "ESP › Flash Encrypted App"
+			},
+			{
+				"command": "esp.eraseFlash",
+				"title": "ESP › Erase Flash"
+			},
+			{
+				"command": "esp.stopMonitor",
+				"title": "ESP › Stop Monitor"
+			},
+			{
+				"command": "esp.spiffs",
+				"title": "ESP › Make SPIFFS"
+			},
+			{
+				"command": "esp.efuseCommon",
+				"title": "ESP › eFuse Common Table"
+			},
+			{
+				"command": "esp.efuseCustom",
+				"title": "ESP › eFuse Custom Table"
+			},
+			{
+				"command": "esp.showEfuse",
+				"title": "ESP › Show eFuse Table"
+			},
+			{
+				"command": "esp.eraseOta",
+				"title": "ESP › Erase OTA Data"
+			},
+			{
+				"command": "esp.readOta",
+				"title": "ESP › Read OTA Data"
+			},
+			{
+				"command": "esp.generateIntelliSense",
+				"title": "ESP › Generate IntelliSense Config"
+			},
+			{
+				"command": "esp.generateTasks",
+				"title": "ESP › Generate tasks.json"
+			},
+			{
+				"command": "esp.createProject",
+				"title": "ESP › Create New Project"
+			},
+			{
+				"command": "esp.selectPort",
+				"title": "ESP › Select Port"
+			},
+			{
+				"command": "esp.selectFlashBaud",
+				"title": "ESP › Select Flash Baud Rate"
+			},
+			{
+				"command": "esp.selectIdf",
+				"title": "ESP › Select IDF Path"
+			},
+			{
+				"command": "esp.selectProject",
+				"title": "ESP › Select Project"
+			},
+			{
+				"command": "esp.toggleOverride",
+				"title": "ESP › Toggle Flash Override"
+			},
+			{
+				"command": "esp.selectFlashMode",
+				"title": "ESP › Select Flash Mode"
+			},
+			{
+				"command": "esp.selectFlashFreq",
+				"title": "ESP › Select Flash Frequency"
+			},
+			{
+				"command": "esp.selectFlashSize",
+				"title": "ESP › Select Flash Size"
+			},
+			{
+				"command": "esp.toggleCompressedUpload",
+				"title": "ESP › Toggle Compressed Upload"
+			},
+			{
+				"command": "esp.selectBeforeFlashing",
+				"title": "ESP › Select Before Flashing"
+			},
+			{
+				"command": "esp.selectAfterFlashing",
+				"title": "ESP › Select After Flashing"
+			},
+			{
+				"command": "esp.selectMonitorBaud",
+				"title": "ESP › Select Monitor Baud Rate"
+			},
+			{
+				"command": "esp.configureBuild",
+				"title": "Configure pre/post build actions",
+				"icon": "$(checklist)"
+			},
+			{
+				"command": "esp.configureFlash",
+				"title": "Configure post-flash actions",
+				"icon": "$(checklist)"
+			},
+			{
+				"command": "esp.refreshViews",
+				"title": "Refresh",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "esp.collapseAll",
+				"title": "Collapse All",
+				"icon": "$(collapse-all)"
+			},
+			{
+				"command": "esp.partitionEditor",
+				"title": "ESP › Partition Table Editor"
+			},
+			{
+				"command": "esp.selectNonosSdk",
+				"title": "ESP › Select NonOS SDK Path"
+			},
+			{
+				"command": "esp.selectSdkType",
+				"title": "ESP › Switch SDK (RTOS / NonOS)"
+			},
+			{
+				"command": "esp.nonos.build",
+				"title": "ESP NonOS › Build"
+			},
+			{
+				"command": "esp.nonos.clean",
+				"title": "ESP NonOS › Clean"
+			},
+			{
+				"command": "esp.nonos.flash",
+				"title": "ESP NonOS › Flash"
+			},
+			{
+				"command": "esp.nonos.flashErase",
+				"title": "ESP NonOS › Flash + Erase"
+			},
+			{
+				"command": "esp.nonos.monitor",
+				"title": "ESP NonOS › Monitor"
+			},
+			{
+				"command": "esp.nonos.stopMonitor",
+				"title": "ESP NonOS › Stop Monitor"
+			}
+		],
+		"menus": {
+			"view/item/context": [
+				{
+					"command": "esp.configureBuild",
+					"when": "view == esp-idf-tools.projectView && viewItem == buildItem",
+					"group": "inline"
+				},
+				{
+					"command": "esp.configureFlash",
+					"when": "view == esp-idf-tools.projectView && viewItem == flashItem",
+					"group": "inline"
+				},
+				{
+					"command": "esp.toggleOverride",
+					"when": "view == esp-idf-tools.projectView && viewItem == sourceItem",
+					"group": "inline"
+				}
+			],
+			"view/title": [
+				{
+					"command": "esp.collapseAll",
+					"when": "view == esp-idf-tools.projectView",
+					"group": "navigation@1"
+				},
+				{
+					"command": "esp.refreshViews",
+					"when": "view == esp-idf-tools.projectView",
+					"group": "navigation@2"
+				}
+			]
+		},
+		"configuration": {
+			"title": "ESP-IDF Tools",
+			"properties": {
+				"esp-idf-tools.postBuildAction": {
+					"type": "string",
+					"enum": [
+						"none",
+						"flash",
+						"flash_monitor"
+					],
+					"enumDescriptions": [
+						"Build only",
+						"Auto flash after build",
+						"Auto flash and open monitor"
+					],
+					"default": "none",
+					"description": "Action after successful build"
+				},
+				"esp-idf-tools.postFlashAction": {
+					"type": "string",
+					"enum": [
+						"none",
+						"monitor"
+					],
+					"enumDescriptions": [
+						"Flash only",
+						"Auto open monitor after flash"
+					],
+					"default": "none",
+					"description": "Action after successful flash"
+				},
+				"esp-idf-tools.preBuildAction": {
+					"type": "string",
+					"enum": [
+						"none",
+						"clean",
+						"fullclean"
+					],
+					"enumDescriptions": [
+						"No clean",
+						"Clean (clean)",
+						"Full clean (fullclean)"
+					],
+					"default": "none",
+					"description": "Action before build"
+				},
+				"esp-idf-tools.idfPath": {
+					"type": "string",
+					"default": "",
+					"description": "Path to ESP8266_RTOS_SDK"
+				},
+				"esp-idf-tools.comPort": {
+					"type": "string",
+					"default": "",
+					"description": "COM port for flashing (e.g., COM3 or /dev/ttyUSB0)"
+				},
+				"esp-idf-tools.overrideFlashConfig": {
+					"type": "boolean",
+					"default": false,
+					"description": "Use manual flash settings instead of menuconfig"
+				},
+				"esp-idf-tools.flashBaud": {
+					"type": "number",
+					"default": 115200,
+					"description": "Flash baud rate"
+				},
+				"esp-idf-tools.flashMode": {
+					"type": "string",
+					"default": "dio",
+					"enum": [
+						"dio",
+						"dout",
+						"qio",
+						"qout"
+					],
+					"description": "SPI Flash mode"
+				},
+				"esp-idf-tools.flashFreq": {
+					"type": "string",
+					"default": "40m",
+					"enum": [
+						"40m",
+						"80m",
+						"20m",
+						"26m"
+					],
+					"description": "SPI Flash frequency"
+				},
+				"esp-idf-tools.flashSize": {
+					"type": "string",
+					"default": "2MB",
+					"enum": [
+						"1MB",
+						"2MB",
+						"4MB",
+						"8MB",
+						"16MB"
+					],
+					"description": "SPI Flash size"
+				},
+				"esp-idf-tools.useCompressedUpload": {
+					"type": "boolean",
+					"default": true,
+					"description": "Use compressed upload (-z)"
+				},
+				"esp-idf-tools.beforeFlashing": {
+					"type": "string",
+					"enum": [
+						"default_reset",
+						"no_reset",
+						"no_reset_no_sync"
+					],
+					"default": "default_reset",
+					"description": "Action before flashing"
+				},
+				"esp-idf-tools.afterFlashing": {
+					"type": "string",
+					"enum": [
+						"hard_reset",
+						"no_reset"
+					],
+					"default": "hard_reset",
+					"description": "Action after flashing"
+				},
+				"esp-idf-tools.monitorBaud": {
+					"type": "number",
+					"default": 74880,
+					"description": "Monitor baud rate (passed via MONITORBAUD env variable)"
+				},
+				"esp-idf-tools.shellPath": {
+					"type": "string",
+					"default": "",
+					"description": "Shell path (e.g. powershell.exe or /bin/bash). Leave empty for auto-detection."
+				},
+				"esp-idf-tools.spiffsSize": {
+					"type": "number",
+					"default": 262144,
+					"description": "SPIFFS image size in bytes"
+				},
+				"esp-idf-tools.spiffsBlock": {
+					"type": "number",
+					"default": 4096,
+					"description": "SPIFFS block size"
+				},
+				"esp-idf-tools.spiffsPage": {
+					"type": "number",
+					"default": 256,
+					"description": "SPIFFS page size"
+				},
+				"esp-idf-tools.reuseTerminal": {
+					"type": "boolean",
+					"default": true,
+					"description": "Reuse existing terminal instead of creating a new one each time"
+				},
+				"esp-idf-tools.useExecutionPolicyBypass": {
+					"type": "boolean",
+					"default": true,
+					"description": "On Windows, use -ExecutionPolicy Bypass for PowerShell"
+				},
+				"esp-idf-tools.saveSettingsToWorkspace": {
+					"type": "boolean",
+					"default": true,
+					"description": "Save project-specific settings to workspace instead of global settings"
+				},
+				"esp-idf-tools.autoGenerateOnOpen": {
+					"type": "boolean",
+					"default": true,
+					"description": "Automatically generate IntelliSense config and tasks.json on project open (only if files don't exist yet)"
+				},
+				"esp-idf-tools.postBuildAnalysis": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"enum": [
+							"size",
+							"size-components",
+							"size-files"
+						]
+					},
+					"default": [],
+					"description": "Analysis commands to run automatically after a successful build"
+				}
+			}
+		}
+	},
+	"__metadata": {
+		"installedTimestamp": 1772701513056,
+		"targetPlatform": "undefined",
+		"size": 168586
+	}
+}
