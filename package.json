@@ -2,7 +2,7 @@
   "name": "esp-idf-tools",
   "displayName": "ESP8266 / ESP8285 Tools",
   "description": "Build, flash, monitor and configure ESP8266/ESP8285 projects. Supports ESP8266_RTOS_SDK (idf.py) and ESP8266_NonOS_SDK.",
-  "version": "1.9.0",
+  "version": "1.9.2",
   "publisher": "Dzantemir",
   "engines": {
     "vscode": "^1.75.0"
@@ -13,6 +13,7 @@
   ],
   "icon": "media/icon.png",
   "activationEvents": [
+    "onView:esp-idf-tools.projectView",
     "workspaceContains:sdkconfig",
     "workspaceContains:Makefile",
     "workspaceContains:CMakeLists.txt",
@@ -298,6 +299,18 @@
         "command": "esp.deleteComponent",
         "title": "ESP › Delete Component",
         "icon": "$(trash)"
+      },
+      {
+        "command": "esp.fixPython",
+        "title": "ESP: Download Python 3.7"
+      },
+      {
+        "command": "esp.fixSdk",
+        "title": "ESP: Clone or Set SDK Path"
+      },
+      {
+        "command": "esp.setPythonPath",
+        "title": "ESP: Set Python 3.7 folder"
       }
     ],
     "menus": {
@@ -391,6 +404,11 @@
           "type": "string",
           "default": "",
           "description": "Path to ESP8266_RTOS_SDK"
+        },
+        "esp-idf-tools.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Python 3.7 installation folder (e.g. C:\\Python37-32). Leave empty to auto-detect."
         },
         "esp-idf-tools.comPort": {
           "type": "string",

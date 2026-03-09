@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.9.2]
+- Sidebar: full tree always visible even without project folder selected — commands show error only when needed
+- Check order: all commands now follow strict sequence: Python → IDF path → Tools → Project folder → Port
+- Port check dialog: removed "Flash anyway" button — only "Select another port" or Cancel
+- Port check: added to NONOS Monitor (was missing)
+- Startup: no more double notifications — environment check runs silently, warnings appear only in sidebar tree
+- Startup: `checkAndInstallTools` now runs silently (no popup if Python not found at startup)
+- Python error: unified — shown only once per command (removed duplicate messages from individual commands)
+- Project folder error: unified message "ESP: Select project folder!" with "Select Folder" button in all 6 places
+- pip install: status bar busy spinner shown during installation
+- `version.txt`: validation now uses same regex as `idf_tools.py` (`v\d+\.\d+`) — reads first 16 bytes
+- `version.txt`: removed `.git` folder check — was irrelevant to file content validity
+- Code: removed unused `_busyCommands` variable
+- Code: removed redundant `checkBusy()` call in `runWithPostFlash`
+- New extension icon
+
+## [1.9.1]
+- Environment check on startup: validates Git, Python 3.7, SDK — shows warnings in sidebar tree
+- Sidebar warnings: ⚠️ Git not installed / ⚠️ Python 3.7 not found — click to fix
+- SDK setup: RTOS IDF and NonOS SDK buttons now offer **Clone via Git** option (only shown when Git is installed)
+- Clone SDK: select target folder → `git clone --recursive` → auto-sets SDK path → auto-installs tools
+- All commands (Build, Flash, Monitor, Clone) blocked while another command is running
+- Build: checks Git and Python before starting — shows actionable error with download link if missing
+- Build: fresh Python check on every run (bypasses cache) — detects if Python was uninstalled
+- Install Tools: checks Python availability before starting installation
+- Python error message: added hint to check "Add Python to PATH" during setup
+- VSCode window focus: silently re-checks environment when returning from another app
+- Removed setuptools==69.5.1 workaround (not needed with Python 3.7)
+
 ## [1.9.0]
 - Project Folder: added **Components** subgroup — shows `components/` folder contents automatically
 - Project Folder: inline `[+]` button on "Project Folder" header — launches Add Component wizard

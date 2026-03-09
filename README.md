@@ -17,16 +17,18 @@ Supports both **ESP8266_RTOS_SDK** (`idf.py`) and **ESP8266_NonOS_SDK** (`make`)
 ### ⚡ Flash
 - **Flash** — flash firmware to device
 - **Flash App / Bootloader / Partition Table** — flash individual components
-- **Flash & Monitor** — flash then immediately open serial monitor
+- **Flash Encrypted / Flash Encrypted App** — encrypted flash variants
 - **Erase Flash** — full flash erase
+- Port availability check before flashing — prompts to select another port if device not connected
 
 ### 🖥️ Monitor
 - **Monitor** — open serial monitor
 - **Stop Monitor** — close serial monitor
 - Configurable baud rate
+- Port availability check before opening monitor
 
 ### 🔧 SDK Configure
-- **Menuconfig** — visual configuration (idf.py menuconfig)
+- **Menuconfig** — visual configuration (`idf.py menuconfig`)
 - **Reconfigure** — re-run CMake configuration
 - **Reset Config** — delete sdkconfig and restore defaults
 
@@ -63,7 +65,7 @@ Visual editor for ESP8266 flash partition tables:
 
 ### 🛠️ Utilities
 - **Make SPIFFS** — pack `data/` folder into SPIFFS image using `mkspiffs`
-- **Create Custom Partitions** — open partition table editor
+- **Custom Partitions** — open partition table editor
 
 ### ⚗️ Advanced (Experimental)
 - eFuse Common / Custom Table generation
@@ -79,11 +81,12 @@ Visual editor for ESP8266 flash partition tables:
 ## Requirements
 
 ### For ESP8266_RTOS_SDK (idf.py):
-- [ESP8266_RTOS_SDK](https://github.com/espressif/ESP8266_RTOS_SDK) installed
-- Python 3 with `idf.py` in PATH or configured via extension settings
+- [Python 3.7.x](https://www.python.org/downloads/release/python-379/) — **must be 3.7.x**, newer versions are not compatible with ESP8266 SDK
+  > ⚠️ During installation check **"Add Python to PATH"**
+- [ESP8266_RTOS_SDK](https://github.com/espressif/ESP8266_RTOS_SDK) — download and set path via extension settings
 
 ### For ESP8266_NonOS_SDK (make):
-- [ESP8266_NonOS_SDK](https://github.com/espressif/ESP8266_NONOS_SDK) installed
+- [ESP8266_NonOS_SDK](https://github.com/espressif/ESP8266_NONOS_SDK) — set path via extension settings
 - `make` toolchain in PATH
 
 ### For SPIFFS:
@@ -91,13 +94,27 @@ Visual editor for ESP8266 flash partition tables:
 
 ---
 
-## Setup
+## Setup (Fresh Install)
 
-1. Install the extension
-2. Open your ESP8266 project folder
-3. In the **ESP-IDF** sidebar panel, set the SDK path via **SDK Path Settings**
-4. Select your COM port via **Serial Source Settings**
-5. Run **Build** → **Flash** → **Monitor**
+1. Install the extension — sidebar shows the full command tree immediately
+2. **Install Python 3.7** — click ⚠️ Python 3.7 not found in sidebar → Download Python 3.7
+   > ⚠️ During Python installation, check **"Add Python to PATH"**
+3. **Set up SDK** — in sidebar, click **RTOS IDF: not set** or **NonOS SDK: not set** and point to your SDK folder
+4. **Install build tools** — extension detects missing tools and offers to install automatically
+5. Select your COM port via **Serial Source Settings → Port**
+6. Run **Build** → **Flash** → **Monitor**
+
+---
+
+## Command Check Order
+
+Every command verifies prerequisites in this order before executing:
+
+1. **Python 3.7** — if not found, shows download prompt
+2. **IDF path** — if not set, shows settings prompt
+3. **Build tools** — if missing, offers automatic installation
+4. **Project folder** — if not selected, shows folder picker
+5. **COM port** — if not connected, shows port selector
 
 ---
 
@@ -106,10 +123,14 @@ Visual editor for ESP8266 flash partition tables:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `esp-idf-tools.idfPath` | Path to ESP8266_RTOS_SDK | |
+| `esp-idf-tools.nonosSdkPath` | Path to ESP8266_NonOS_SDK | |
+| `esp-idf-tools.sdkType` | SDK type: `auto`, `rtos`, `nonos` | `auto` |
+| `esp-idf-tools.pythonPath` | Manual path to Python 3.7 folder | |
 | `esp-idf-tools.comPort` | COM port (e.g. `COM3` or `/dev/ttyUSB0`) | |
 | `esp-idf-tools.flashBaud` | Flash baud rate | `115200` |
 | `esp-idf-tools.flashSize` | Flash size | `2MB` |
 | `esp-idf-tools.flashMode` | SPI flash mode (`dio`, `qio`, …) | `dio` |
+| `esp-idf-tools.flashFreq` | SPI flash frequency | `40m` |
 | `esp-idf-tools.monitorBaud` | Serial monitor baud rate | `74880` |
 | `esp-idf-tools.postBuildAction` | Auto action after build (`none`, `flash`, `flash_monitor`) | `none` |
 | `esp-idf-tools.postFlashAction` | Auto action after flash (`none`, `monitor`) | `none` |

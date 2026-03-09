@@ -18,15 +18,19 @@ let outputChannel     = null;
 let portCache         = { data:[], timestamp: 0 };
 let _pythonCmd        = null;
 let _pythonCmdTime    = 0;
+let _idfPathOverride  = null;  // temporary override until onDidChangeConfiguration fires
+let _nonosSdkOverride = null;  // temporary override until onDidChangeConfiguration fires
+let _toolsVerified    = false; // true once idf_tools.py check passed — reset on SDK/Python change
+
 const PYTHON_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 let _hotplugWatcher   = null;      // fs.FSWatcher for Linux/macOS
 let _hotplugPollTimer = null;      // setInterval for Windows
 let _prevWinPorts     = new Set(); // baseline COM port set for Windows hotplug
 let _statusBarPort    = null;      // StatusBarItem — port
 let _statusBarBusy    = null;      // StatusBarItem — busy indicator
-let _busyCommands     = new Set(); // commands currently running (build/flash)
 let _globalBusy       = false;     // true while ANY command is running
 let _globalBusyName   = '';        // name of running command (for messages)
+let provider          = null;      // EspProvider instance (set in activate)
 let _partitionPanels  = new Set(); // open Partition Editor panels
 let _partitionPanel   = null;      // singleton — only one editor at a time
 
@@ -54,14 +58,17 @@ function log(msg) {
 
 // ─── Config helpers ───────────────────────────────────────────────────────────
 function cfg(key) {
-    return vscode.workspace.getConfiguration('esp-idf-tools').get(key);
+    return vscode.workspace.getConfiguration('esp-idf-tools', null).get(key);
 }
 
 async function setCfg(key, val) {
-    const target = (cfg('saveSettingsToWorkspace') && vscode.workspace.workspaceFolders?.length)
-        ? vscode.ConfigurationTarget.Workspace
-        : vscode.ConfigurationTarget.Global;
-    await vscode.workspace.getConfiguration('esp-idf-tools').update(key, val, target);
+    const config = vscode.workspace.getConfiguration('esp-idf-tools');
+    if (cfg('saveSettingsToWorkspace') && vscode.workspace.workspaceFolders?.length) {
+        await config.update(key, val, vscode.ConfigurationTarget.Workspace);
+    } else {
+        try { await config.update(key, undefined, vscode.ConfigurationTarget.Workspace); } catch {}
+        await config.update(key, val, vscode.ConfigurationTarget.Global);
+    }
 }
 
 // ─── Path helpers ─────────────────────────────────────────────────────────────
@@ -71,7 +78,7 @@ function expandHome(p) {
 }
 
 function getValidIdfPath() {
-    const p = expandHome(cfg('idfPath')) || process.env.IDF_PATH;
+    const p = expandHome(_idfPathOverride || cfg('idfPath')) || process.env.IDF_PATH;
     if (!p || !fs.existsSync(p)) return null;
     if (!fs.existsSync(path.join(p, 'tools', 'idf_tools.py'))) return null;
     return p;
@@ -79,7 +86,7 @@ function getValidIdfPath() {
 
 // ─── NONOS SDK detection ──────────────────────────────────────────────────────
 function getValidNonosSdkPath() {
-    const p = expandHome(cfg('nonosSdkPath')) || process.env.SDK_PATH;
+    const p = expandHome(_nonosSdkOverride || cfg('nonosSdkPath')) || process.env.SDK_PATH;
     if (!p || !fs.existsSync(p)) return null;
     if (!fs.existsSync(path.join(p, 'include')) || !fs.existsSync(path.join(p, 'lib'))) return null;
     return p;
@@ -101,581 +108,237 @@ function getUserShell() {
 }
 
 // ─── Python detection (cached) ────────────────────────────────────────────────
-async function getPythonCmd() {
-    if (_pythonCmd && (Date.now() - _pythonCmdTime < PYTHON_CACHE_TTL)) return _pythonCmd;
-    const candidates = IS_WIN ? ['python', 'python3'] : ['python3', 'python'];
-    for (const cmd of candidates) {
-        const ok = await new Promise(r =>
-            cp.exec(`${cmd} --version`, { timeout: 3000 }, e => r(!e))
-        );
-        if (ok) {
-            _pythonCmd = cmd;
-            _pythonCmdTime = Date.now();
-            log(`Python detected: ${cmd}`);
-            return _pythonCmd;
-        }
-    }
-    log('Python not found in PATH');
-    return null;
-}
+// Returns Python cmd only if version is 3.7.x — warns user if wrong version found
+// Strip PowerShell-only "& " prefix — cp.exec uses cmd.exe where & is invalid
+function toExecCmd(cmd) { return (cmd || '').replace(/^& /, ''); }
 
-// ─── Compiler path detection for IntelliSense ────────────────────────────────
-function findXtensaGcc() {
-    const espressifTools = path.join(
-        os.homedir(),
-        IS_WIN ? path.join('AppData', 'Roaming', 'Espressif', 'tools') : '.espressif/tools'
+// ─── pip availability check ───────────────────────────────────────────────────
+// Returns true if pip is available, false if not.
+// warn=true  → shows a warning notification (used in getPythonCmd / cmdSetPythonPath)
+// warn=false → shows an error notification (used before pip install, blocks execution)
+async function checkPip(pythonCmd, warn = true) {
+    const execCmd = toExecCmd(pythonCmd);
+    const hasPip = await new Promise(r =>
+        cp.exec(`${execCmd} -m pip --version`, { timeout: 8000 }, (e, stdout, stderr) => {
+            log(`[pip] check execCmd="${execCmd}" ok=${!e} out="${(stdout||'').trim()}" err="${(stderr||'').trim()}"`);
+            r(!e);
+        })
     );
-    const xtensaRoot = path.join(espressifTools, 'xtensa-lx106-elf');
-    if (!fs.existsSync(xtensaRoot)) return '';
+    if (hasPip) return true;
 
-    try {
-        const gccBin = IS_WIN ? 'xtensa-lx106-elf-gcc.exe' : 'xtensa-lx106-elf-gcc';
-        const versions = fs.readdirSync(xtensaRoot)
-            .filter(d => fs.statSync(path.join(xtensaRoot, d)).isDirectory())
-            .sort()
-            .reverse();
+    const msg = warn
+        ? `ESP: Python 3.7 found but pip is missing.`
+        : `ESP: pip not found — cannot install requirements.`;
+    const showFn = warn ? vscode.window.showWarningMessage : vscode.window.showErrorMessage;
 
-        for (const ver of versions) {
-            const candidate = path.join(xtensaRoot, ver, 'bin', gccBin);
-            if (fs.existsSync(candidate)) {
-                log(`Found xtensa gcc: ${candidate}`);
-                return candidate;
-            }
+    const ans = await showFn(msg, 'Install pip', 'Download Python 3.7');
+
+    if (ans === 'Install pip') {
+        log(`[pip] installing via ensurepip for ${pythonCmd}`);
+
+        setBusy('Install pip');
+
+        // Показываем терминал чтобы пользователь видел ход установки
+        const t = getTerm('ESP: Install pip');
+        t.show(true);
+
+        const markerFile = path.join(os.tmpdir(), `esp_pip_${Date.now()}.tmp`);
+        const termCmd = (IS_WIN && pythonCmd.startsWith('"')) ? `& ${pythonCmd}` : pythonCmd;
+        t.sendText(`${termCmd} -m ensurepip --upgrade${buildMarkerCmd(markerFile)}`);
+
+        await watchCommandDone(markerFile, 'ESP: Install pip');
+        clearBusy();
+
+        // Перепроверяем pip после установки
+        const pipOk = await new Promise(r =>
+            cp.exec(`${pythonCmd} -m pip --version`, { timeout: 5000 }, (e) => r(!e))
+        );
+        if (pipOk) {
+            vscode.window.showInformationMessage('ESP: pip installed successfully!');
+            log(`[pip] ensurepip succeeded for ${pythonCmd}`);
+            return true;
+        } else {
+            vscode.window.showErrorMessage('ESP: Failed to install pip. Try reinstalling Python 3.7.');
+            log(`[pip] ensurepip failed for ${pythonCmd}`);
+            return false;
         }
-    } catch { /* ignore */ }
-    return '';
-}
-
-
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  HELPERS: Busy Lock                                                ║
-// ╚══════════════════════════════════════════════════════════════════╝
-// ─── Global busy lock ────────────────────────────────────────────────────────
-function setBusy(name) {
-    _globalBusy     = true;
-    _globalBusyName = name;
-    vscode.commands.executeCommand('setContext', 'esp.busy', true);
-    if (_statusBarBusy) {
-        _statusBarBusy.text    = `$(sync~spin) ${name}`;
-        _statusBarBusy.tooltip = `ESP: running — ${name}\nAll commands are locked until finished`;
-        _statusBarBusy.show();
     }
-    // Notify all open Partition Editor panels → disable Save CSV
-    _partitionPanels.forEach(p => {
-        try { p.webview.postMessage({ command: 'setBusy', busy: true, task: name }); } catch {}
-    });
-    log(`[BUSY] locked by: ${name}`);
-}
 
-function clearBusy() {
-    _globalBusy     = false;
-    _globalBusyName = '';
-    vscode.commands.executeCommand('setContext', 'esp.busy', false);
-    if (_statusBarBusy) _statusBarBusy.hide();
-    // Notify all open Partition Editor panels → re-enable Save CSV
-    _partitionPanels.forEach(p => {
-        try { p.webview.postMessage({ command: 'setBusy', busy: false, task: '' }); } catch {}
-    });
-    log('[BUSY] released');
-}
+    if (ans === 'Download Python 3.7')
+        vscode.env.openExternal(vscode.Uri.parse('https://www.python.org/downloads/release/python-379/'));
 
-function checkBusy() {
-    if (_globalBusy) {
-        vscode.window.showWarningMessage(
-            `ESP: "${_globalBusyName}" is running. Wait for it to finish.`,
-            'Show Terminal'
-        ).then(c => { if (c === 'Show Terminal') vscode.commands.executeCommand('workbench.action.terminal.focus'); });
-        return true;
-    }
+    log(`[pip] not found for ${pythonCmd}`);
     return false;
 }
 
-// ─── Status bar ──────────────────────────────────────────────────────────────
+async function getPythonCmd(force = false, silent = false) {
+    if (!force && _pythonCmd && (Date.now() - _pythonCmdTime < PYTHON_CACHE_TTL)) return _pythonCmd;
 
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  HELPERS: Status Bar                                               ║
-// ╚══════════════════════════════════════════════════════════════════╝
-function createStatusBar(ctx) {
-    _statusBarPort = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    _statusBarPort.command = 'esp.selectPort';
-    ctx.subscriptions.push(_statusBarPort);
+    // Helper: returns "X.Y" version string or null
+    const getVersion = (cmd) => new Promise(r =>
+        cp.exec(`${cmd} --version`, { timeout: 3000 }, (e, stdout, stderr) => {
+            const m = (stdout + stderr).trim().match(/Python (\d+\.\d+)/);
+            r(m ? m[1] : null);
+        })
+    );
 
-    _statusBarBusy = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
-    _statusBarBusy.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-    ctx.subscriptions.push(_statusBarBusy);
-    // starts hidden — shown only when busy
+    // Helper: cache and return found pythonCmd
+    const found = async (cmd, label) => {
+        // cp.exec использует cmd без &, терминал PowerShell требует & перед quoted path
+        const termCmd = (IS_WIN && cmd.startsWith('"')) ? `& ${cmd}` : cmd;
+        _pythonCmd     = termCmd;
+        _pythonCmdTime = Date.now();
+        log(`Python 3.7 detected (${label}): ${termCmd}`);
+        await checkPip(cmd); // checkPip использует cp.exec — передаём без &
+        return termCmd;
+    };
 
-    refreshStatusBar();
-}
-
-function refreshStatusBar() {
-    if (!_statusBarPort) return;
-    const port          = cfg('comPort');
-    const overrideFlash = cfg('overrideFlashConfig');
-    const modeLabel     = overrideFlash ? 'Manual' : 'Menuconfig';
-    if (port) {
-        _statusBarPort.text            = `$(plug) ${port}`;
-        _statusBarPort.tooltip         = `ESP port: ${port}[${modeLabel} mode]\nClick to change port`;
-        _statusBarPort.backgroundColor = undefined;
-    } else {
-        _statusBarPort.text            = `$(plug) No port`;
-        _statusBarPort.tooltip         = `ESP: No port selected  [${modeLabel} mode]\nClick to select port`;
-        _statusBarPort.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-    }
-    _statusBarPort.show();
-}
-
-// ─── TreeItem ─────────────────────────────────────────────────────────────────
-
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  TREE VIEW: EspItem / EspGroup / EspProvider                       ║
-// ╚══════════════════════════════════════════════════════════════════╝
-class EspItem extends vscode.TreeItem {
-    constructor(label, opts = {}) {
-        super(label, vscode.TreeItemCollapsibleState.None);
-        this.command     = opts.command ? { command: opts.command, title: label } : undefined;
-        this.iconPath    = opts.icon    ? new vscode.ThemeIcon(opts.icon) : undefined;
-        this.description = opts.desc   || '';
-        this.tooltip     = opts.tooltip || label;
-        if (opts.contextValue) this.contextValue = opts.contextValue;
-    }
-}
-
-class EspGroup extends vscode.TreeItem {
-    constructor(id, label, children, contextValue = undefined, defaultState = vscode.TreeItemCollapsibleState.Collapsed, tooltip = undefined) {
-        let state = defaultState;
-        if (globalCtx) {
-            const saved = globalCtx.workspaceState.get(`espGroupState_${id}`);
-            if (saved !== undefined) state = saved;
-        }
-        super(label, state);
-        this.id = id;
-        this._children = children;
-        if (contextValue) this.contextValue = contextValue;
-        if (tooltip)      this.tooltip      = tooltip;
-    }
-}
-
-// ─── TreeDataProvider ─────────────────────────────────────────────────────────
-class EspProvider {
-    constructor() {
-        this._emitter = new vscode.EventEmitter();
-        this.onDidChangeTreeData = this._emitter.event;
-    }
-    refresh() { this._emitter.fire(undefined); }
-    getTreeItem(el) { return el; }
-    getChildren(el) {
-        if (el instanceof EspGroup) return el._children;
-        if (el) return[];
-
-        const root          = getActiveRoot();
-        const port          = cfg('comPort') || '—';
-        const configuredIdf = expandHome(cfg('idfPath'));
-        const validIdf      = getValidIdfPath();
-        const folders       = vscode.workspace.workspaceFolders ||[];
-        const projectName   = root ? path.basename(root) : 'folder not found';
-
-        const projectGroup = new EspGroup('projectGroup', '📁  Project Folder',[
-            new EspItem(projectName, {
-                command: 'esp.selectProject',
-                icon:    root ? (folders.length > 1 ? 'folder-active' : 'folder') : 'error',
-                tooltip: root || 'Select project workspace folder',
-                desc:    root ? (folders.length > 1 ? 'click to change' : '') : 'click to select',
-            }),
-            ...( (() => {
-                if (!root) return [];
-                const compDir = path.join(root, 'components');
-                if (!fs.existsSync(compDir)) return [];
-                const comps = fs.readdirSync(compDir).filter(n =>
-                    fs.statSync(path.join(compDir, n)).isDirectory()
-                );
-                if (!comps.length) return [];
-                const compItems = comps.map(name => {
-                    const item = new EspItem(name, {
-                        icon: 'package',
-                        tooltip: `Component: ${name}\n${path.join(compDir, name)}`,
-                    });
-                    item.contextValue = 'componentItem';
-                    item._compName = name;
-                    return item;
-                });
-                return [ new EspGroup('componentsGroup', '📦  Components', compItems, undefined,
-                    vscode.TreeItemCollapsibleState.Expanded) ];
-            })() )
-        ], 'projectFolderGroup');
-
-        const createProjectItem = new EspItem('Create New Project', {
-            command: 'esp.createProject',
-            icon: 'new-folder',
-            tooltip: 'Create a new ESP8266 RTOS SDK project from template'
-        });
-
-        const overrideFlash = cfg('overrideFlashConfig');
-        const flashBaud   = cfg('flashBaud')            || 115200;
-        const flashMode   = cfg('flashMode')            || 'dio';
-        const flashFreq   = cfg('flashFreq')            || '40m';
-        const flashSize   = cfg('flashSize')            || '2MB';
-        const compressed  = cfg('useCompressedUpload')  ?? true;
-        const beforeFlash = cfg('beforeFlashing')       || 'default_reset';
-        const afterFlash  = cfg('afterFlashing')        || 'hard_reset';
-        const monitorBaud = cfg('monitorBaud')          || 74880;
-
-        let idfLabel   = 'not set';
-        let idfDesc    = 'click to specify';
-        let idfTooltip = 'Click to specify ESP8266_RTOS_SDK folder';
-
-        if (validIdf) {
-            idfLabel   = path.basename(validIdf);
-            idfTooltip = validIdf;
-            idfDesc    = configuredIdf ? '' : '(from environment)';
-        } else if (configuredIdf) {
-            idfLabel   = path.basename(configuredIdf);
-            idfDesc    = 'error (invalid path)';
-            idfTooltip = 'tools/idf_tools.py not found';
-        }
-
-        const manualSettings =[
-            new EspItem(`Port: ${port}`,                       { command: 'esp.selectPort',           icon: 'plug',           tooltip: 'Click to select port', desc: port === '—' ? 'not selected' : '' }),
-            new EspItem(`Baud rate: ${flashBaud}`,             { command: 'esp.selectFlashBaud',      icon: 'dashboard',      tooltip: 'Flash speed' }),
-            new EspItem(`Flash Mode: ${flashMode}`,            { command: 'esp.selectFlashMode',      icon: 'chip',           tooltip: 'SPI Flash mode' }),
-            new EspItem(`Flash Freq: ${flashFreq}`,            { command: 'esp.selectFlashFreq',      icon: 'pulse',          tooltip: 'SPI Flash frequency' }),
-            new EspItem(`Flash Size: ${flashSize}`,            { command: 'esp.selectFlashSize',      icon: 'database',       tooltip: 'SPI Flash size' }),
-            new EspItem(`Compression: ${compressed ? 'Yes' : 'No'}`, { command: 'esp.toggleCompressedUpload', icon: 'file-zip', tooltip: 'Use compression when flashing' }),
-            new EspItem(`Before flash: ${beforeFlash}`,        { command: 'esp.selectBeforeFlashing', icon: 'debug-step-over', tooltip: 'Action before flashing' }),
-            new EspItem(`After flash: ${afterFlash}`,          { command: 'esp.selectAfterFlashing',  icon: 'debug-step-out', tooltip: 'Action after flashing' }),
-            new EspItem(`Monitor Baud: ${monitorBaud}`,        { command: 'esp.selectMonitorBaud',    icon: 'terminal',       tooltip: 'Monitor baud rate' }),
-        ];
-
-        let sourceItem;
-        if (overrideFlash) {
-            sourceItem = new EspGroup('sourceGroup', 'Source: Manual', manualSettings, 'sourceItem', vscode.TreeItemCollapsibleState.Expanded);
-        } else {
-            sourceItem = new EspItem('Source: Menuconfig', {
-                command: 'esp.toggleOverride',
-                icon: 'settings',
-                tooltip: 'Click to switch to Manual settings',
-                contextValue: 'sourceItem'
+    // Helper: show final "not found" error
+    const notFound = (wrongVersion) => {
+        log(`Python not found (wrongVersion=${wrongVersion})`);
+        if (silent) return null;
+        const msg = wrongVersion
+            ? `ESP: Python ${wrongVersion} found but ESP8266 SDK requires Python 3.7.x.`
+            : 'ESP: Python 3.7 not found. Install it or set the folder manually.';
+        vscode.window.showWarningMessage(msg, 'Set Python 3.7 folder', 'Download Python 3.7')
+            .then(ans => {
+                if (ans === 'Set Python 3.7 folder')
+                    vscode.commands.executeCommand('esp.setPythonPath');
+                else if (ans === 'Download Python 3.7')
+                    vscode.env.openExternal(vscode.Uri.parse('https://www.python.org/downloads/release/python-379/'));
             });
+        return null;
+    };
+
+    let wrongVersion = null; // first non-3.7 version seen — used in final error message
+
+    // ── Step 1: Manual path ───────────────────────────────────────────────────
+    const manualFolder = cfg('pythonPath') || '';
+    if (manualFolder) {
+        const manualExe = IS_WIN
+            ? path.join(manualFolder, 'python.exe')
+            : path.join(manualFolder, 'python3');
+
+        if (!fs.existsSync(manualExe)) {
+            const ans = await vscode.window.showWarningMessage(
+                `ESP: python.exe not found in: ${manualFolder}`,
+                'Fix manually', 'Try auto-detect'
+            );
+            if (ans !== 'Try auto-detect') {
+                vscode.commands.executeCommand('esp.setPythonPath');
+                return null;
+            }
+        } else {
+            const ver = await getVersion(`"${manualExe}"`);
+            if (ver && ver.startsWith('3.7')) return found(`"${manualExe}"`, 'manual');
+
+            const problem = ver
+                ? `Manual Python path has Python ${ver} (need 3.7.x)`
+                : `Python not found at: ${manualFolder}`;
+            const ans = await vscode.window.showWarningMessage(
+                `ESP: ${problem}.`, 'Fix manually', 'Try auto-detect'
+            );
+            if (ans !== 'Try auto-detect') {
+                vscode.commands.executeCommand('esp.setPythonPath');
+                return null;
+            }
+            if (ver && !wrongVersion) wrongVersion = ver;
         }
-        if (!(sourceItem instanceof EspGroup)) {
-            sourceItem.iconPath = new vscode.ThemeIcon('settings');
-        }
+        // Fall through to auto-detect
+    }
 
-        const sdkType      = getActiveSdkType();
-        const sdkTypeLabel = cfg('sdkType') || 'auto';
-        const nonosSdkPath = getValidNonosSdkPath();
-        const nonosRaw     = expandHome(cfg('nonosSdkPath')) || '';
+    // ── Step 2: по имени напрямую ─────────────────────────────────────────────
+    const nameCandidates = IS_WIN ? ['python'] : ['python3.7', 'python3', 'python'];
+    for (const cmd of nameCandidates) {
+        const ver = await getVersion(cmd);
+        if (ver && ver.startsWith('3.7')) return found(cmd, `name:${cmd}`);
+        if (ver && !wrongVersion) wrongVersion = ver;
+    }
 
-        let nonosLabel   = 'not set';
-        let nonosDesc    = 'click to specify';
-        let nonosTooltip = 'Click to specify ESP8266_NONOS_SDK folder';
-        if (nonosSdkPath) {
-            nonosLabel   = path.basename(nonosSdkPath);
-            nonosTooltip = nonosSdkPath;
-            nonosDesc    = nonosRaw ? '' : '(from environment)';
-        } else if (nonosRaw) {
-            nonosLabel   = path.basename(nonosRaw);
-            nonosDesc    = 'error (invalid path)';
-            nonosTooltip = 'include/ or lib/ not found in this folder';
-        }
-
-        const sdkSwitchItem = new EspItem(`SDK: ${sdkTypeLabel.toUpperCase()}`, {
-            command: 'esp.selectSdkType',
-            icon: 'symbol-enum',
-            tooltip: `Active SDK type: ${sdkTypeLabel}\nClick to switch between RTOS / NonOS / Auto`,
-            desc: sdkType ? `→ ${sdkType}` : 'none detected',
-        });
-
-        if (!sdkType) {
-            return[
-                createProjectItem,
-                projectGroup,
-                new EspGroup('pathSettingsGroup', '🔗  SDK Path Settings',[
-                    sdkSwitchItem,
-                    new EspItem(`RTOS IDF: ${idfLabel}`,  { command: 'esp.selectIdf',      icon: 'folder-opened', tooltip: idfTooltip,  desc: idfDesc }),
-                    new EspItem(`NonOS SDK: ${nonosLabel}`,{ command: 'esp.selectNonosSdk', icon: 'folder-opened', tooltip: nonosTooltip, desc: nonosDesc }),
-                ]),
-                new EspItem('⚠️  No SDK detected — set path above', { icon: 'warning', tooltip: 'Set ESP8266_RTOS_SDK or ESP8266_NONOS_SDK path' }),
-            ];
-        }
-
-        if (!root) {
-            return[createProjectItem, projectGroup,
-                new EspItem('Open a project folder', { icon: 'info', tooltip: 'File > Open Folder' })];
-        }
-
-        if (sdkType === 'nonos') {
-            return[
-                createProjectItem,
-                projectGroup,
-
-                new EspGroup('buildGroup', '⚙️  Build',[
-                    new EspItem('Build',  { command: 'esp.nonos.build', icon: 'tools',     tooltip: 'make all\nBuild the project' }),
-                    new EspItem('Clean',  { command: 'esp.nonos.clean', icon: 'trash',     tooltip: 'make clean\nDelete build output files' }),
-                ]),
-
-                new EspGroup('flashGroup', '⚡  Flash',[
-                    new EspItem('Flash',             { command: 'esp.nonos.flash',      icon: 'zap',   tooltip: 'esptool.py write_flash\nFlash eagle.flash.bin + eagle.irom0text.bin' }),
-                    new EspItem('Erase & Flash',     { command: 'esp.nonos.flashErase', icon: 'zap',   tooltip: 'esptool.py erase_flash + write_flash\nErase chip first, then flash' }),
-                    new EspItem('Erase Flash',       { command: 'esp.eraseFlash',       icon: 'trash', tooltip: 'esptool.py erase_flash\nErase entire flash chip' }),
-                ]),
-
-                new EspGroup('monitorGroup', '🖥️  Monitor',[
-                    new EspItem('Monitor',      { command: 'esp.nonos.monitor',     icon: 'terminal',   tooltip: 'python -m serial.tools.miniterm\nDisplay serial output' }),
-                    new EspItem('Stop Monitor', { command: 'esp.nonos.stopMonitor', icon: 'debug-stop', tooltip: 'Stop monitor terminal\nSends Ctrl+] to the monitor terminal' }),
-                ]),
-
-                new EspGroup('settingsGroup', '⚙️  Serial Source Settings', [
-                    sourceItem,
-                ]),
-
-                new EspGroup('pathSettingsGroup', '🔗  SDK Path Settings',[
-                    sdkSwitchItem,
-                    new EspItem(`NonOS SDK: ${nonosLabel}`, { command: 'esp.selectNonosSdk', icon: 'folder-opened', tooltip: nonosTooltip, desc: nonosDesc }),
-                ]),
-
-                new EspGroup('utilsGroup', '🛠️  Utilities',[
-                    new EspItem('Make SPIFFS', { command: 'esp.spiffs', icon: 'database', tooltip: 'mkspiffs\nPack data/ folder into a SPIFFS image' }),
-                    new EspItem('Create Custom Partitions', { command: 'esp.partitionEditor', icon: 'layout', tooltip: 'Open visual partition table editor\nFilename read from sdkconfig (menuconfig → Partition Table)' }),
-                ]),
-                new EspGroup('vscodeUtilitiesGroup', '🔧  VScode Utilities',[
-                    new EspItem('Generate IntelliSense', { command: 'esp.generateIntelliSense', icon: 'symbol-class', tooltip: 'Generate .vscode/c_cpp_properties.json\nConfigures IntelliSense for ESP8266 includes and defines' }),
-                    new EspItem('Generate tasks.json',   { command: 'esp.generateTasks',        icon: 'tasklist',     tooltip: 'Generate .vscode/tasks.json\nAdds ESP build tasks accessible via Ctrl+Shift+B' }),
-                ]),
-            ];
-        }
-
-        return[
-            createProjectItem,
-            projectGroup,
-
-            new EspGroup('buildGroup', '⚙️  Build',[
-                new EspItem('Build',             { command: 'esp.build',           icon: 'tools',       tooltip: 'idf.py build\nBuild the project', contextValue: 'buildItem' }),
-                new EspItem('Build App',         { command: 'esp.buildApp',        icon: 'file-binary', tooltip: 'idf.py app\nBuild only the app', contextValue: 'buildItem' }),
-                new EspItem('Build Bootloader',  { command: 'esp.buildBootloader', icon: 'file-binary', tooltip: 'idf.py bootloader\nBuild only bootloader', contextValue: 'buildItem' }),
-                new EspItem('Build Part. Table', { command: 'esp.buildPartition',  icon: 'file-binary', tooltip: 'idf.py partition_table\nBuild only partition table', contextValue: 'buildItem' }),
-            ]),
-
-            new EspGroup('flashGroup', '⚡  Flash',[
-                new EspItem('Flash',               { command: 'esp.flash',           icon: 'zap',   tooltip: 'idf.py flash\nFlash the project', contextValue: 'flashItem' }),
-                new EspItem('Flash App',           { command: 'esp.flashApp',        icon: 'zap',   tooltip: 'idf.py app-flash\nFlash the app only', contextValue: 'flashItem' }),
-                new EspItem('Flash Bootloader',    { command: 'esp.flashBootloader', icon: 'zap',   tooltip: 'idf.py bootloader-flash\nFlash bootloader only', contextValue: 'flashItem' }),
-                new EspItem('Flash Part. Table',   { command: 'esp.flashPartition',  icon: 'zap',   tooltip: 'idf.py partition_table-flash\nFlash partition table only', contextValue: 'flashItem' }),
-                new EspItem('Flash Encrypted',     { command: 'esp.flashEncrypted',  icon: 'lock',  tooltip: 'idf.py encrypted-flash\nFlash the encrypted project', contextValue: 'flashItem' }),
-                new EspItem('Flash Encrypted App', { command: 'esp.flashEncApp',     icon: 'lock',  tooltip: 'idf.py encrypted-app-flash\nFlash the encrypted app only', contextValue: 'flashItem' }),
-                new EspItem('Erase Flash',         { command: 'esp.eraseFlash',      icon: 'trash', tooltip: 'idf.py erase_flash\nErase entire flash chip' }),
-            ]),
-
-            new EspGroup('monitorGroup', '🖥️  Monitor',[
-                new EspItem('Monitor',      { command: 'esp.monitor',     icon: 'terminal',   tooltip: 'idf.py monitor\nDisplay serial output' }),
-                new EspItem('Stop Monitor', { command: 'esp.stopMonitor', icon: 'debug-stop', tooltip: 'Stop idf.py monitor\nSends Ctrl+] to the monitor terminal' }),
-            ]),
-
-            new EspGroup('cleanGroup', '🗑️  Clean',[
-                new EspItem('Clean',      { command: 'esp.clean',     icon: 'trash',     tooltip: 'idf.py clean\nDelete build output files from the build directory' }),
-                new EspItem('Full Clean', { command: 'esp.fullclean', icon: 'clear-all', tooltip: 'idf.py fullclean\nDelete the entire build directory contents' }),
-            ]),
-
-            new EspGroup('analysisGroup', '📊  Analysis',[
-                new EspItem('Size',            { command: 'esp.size',           icon: 'graph', tooltip: 'idf.py size\nPrint basic size information about the app' }),
-                new EspItem('Size Components', { command: 'esp.sizeComponents', icon: 'graph', tooltip: 'idf.py size-components\nPrint per-component size information' }),
-                new EspItem('Size Files',      { command: 'esp.sizeFiles',      icon: 'graph', tooltip: 'idf.py size-files\nPrint per-source-file size information' }),
-            ]),
-
-            new EspGroup('settingsGroup', '⚙️  Serial Source Settings',[
-                sourceItem,
-            ]),
-
-            new EspGroup('configureGroup', '🔩  SDK Configure',[
-                new EspItem('Menuconfig',    { command: 'esp.menuconfig',   icon: 'settings-gear', tooltip: 'idf.py menuconfig\nRun "menuconfig" project configuration tool' }),
-                new EspItem('Reconfigure',   { command: 'esp.reconfigure',  icon: 'refresh',       tooltip: 'idf.py reconfigure\nRe-run CMake' }),
-                new EspItem('Reset Config',  { command: 'esp.resetConfig',  icon: 'discard',       tooltip: 'Delete sdkconfig + sdkconfig.old\nResets all menuconfig settings to defaults\nNext build will regenerate sdkconfig automatically' }),
-            ]),
-
-            new EspGroup('pathSettingsGroup', '🔗  SDK Path Settings',[
-                sdkSwitchItem,
-                new EspItem(`RTOS IDF: ${idfLabel}`,   { command: 'esp.selectIdf',      icon: 'folder-opened', tooltip: idfTooltip,  desc: idfDesc }),
-                new EspItem(`NonOS SDK: ${nonosLabel}`, { command: 'esp.selectNonosSdk', icon: 'folder-opened', tooltip: nonosTooltip, desc: nonosDesc }),
-            ]),
-
-            new EspGroup('utilsGroup', '🛠️  Utilities',[
-                new EspItem('Make SPIFFS',             { command: 'esp.spiffs',         icon: 'database', tooltip: 'mkspiffs\nPack data/ folder into a SPIFFS image' }),
-                new EspItem('Create Custom Partitions',{ command: 'esp.partitionEditor',icon: 'layout',   tooltip: 'Open visual partition table editor\nFilename read from sdkconfig (menuconfig → Partition Table)' }),
-            ]),
-            new EspGroup('experimentalGroup', '⚗️  Advanced (Experimental)',[
-                new EspItem('Erase OTA Data',     { command: 'esp.eraseOta',    icon: 'trash', tooltip: '⚠️ EXPERIMENTAL\nidf.py erase_otadata\nErase otadata partition\nMay not work on all hardware or SDK versions' }),
-                new EspItem('Read OTA Data',      { command: 'esp.readOta',     icon: 'book',  tooltip: '⚠️ EXPERIMENTAL\nidf.py read_otadata\nRead otadata partition\nMay not work on all hardware or SDK versions' }),
-                new EspItem('eFuse Common Table', { command: 'esp.efuseCommon', icon: 'table', tooltip: '⚠️ EXPERIMENTAL\nidf.py efuse_common_table\nGenerate C-source for IDF\'s eFuse fields\neFuse operations are irreversible — use with caution!' }),
-                new EspItem('eFuse Custom Table', { command: 'esp.efuseCustom', icon: 'table', tooltip: '⚠️ EXPERIMENTAL\nidf.py efuse_custom_table\nGenerate C-source for user\'s eFuse fields\neFuse operations are irreversible — use with caution!' }),
-                new EspItem('Show eFuse Table',   { command: 'esp.showEfuse',   icon: 'eye',   tooltip: '⚠️ EXPERIMENTAL\nidf.py show_efuse_table\nPrint eFuse table\nMay not work on all hardware or SDK versions' }),
-            ],
-            undefined,
-            vscode.TreeItemCollapsibleState.Collapsed,
-            'Advanced ESP8266 commands — eFuse and OTA data management.\nThese features may not be supported on all hardware revisions or SDK versions.\n⚠️ eFuse writes are irreversible!'),
-            new EspGroup('vscodeUtilitiesGroup', '🔧  VScode Utilities',[
-                new EspItem('Generate IntelliSense', { command: 'esp.generateIntelliSense', icon: 'symbol-class', tooltip: 'Generate .vscode/c_cpp_properties.json\nConfigures IntelliSense for ESP8266 includes and defines' }),
-                new EspItem('Generate tasks.json',   { command: 'esp.generateTasks',        icon: 'tasklist',     tooltip: 'Generate .vscode/tasks.json\nAdds ESP build tasks accessible via Ctrl+Shift+B' }),
-            ]),
+    // ── Step 3: реестр Windows ───────────────────────────────────────────────
+    if (IS_WIN) {
+        const regRoots = [
+            'HKCU\\SOFTWARE\\Python\\PythonCore',              // user install
+            'HKLM\\SOFTWARE\\Python\\PythonCore',              // system 64-bit
+            'HKLM\\SOFTWARE\\WOW6432Node\\Python\\PythonCore', // system 32-bit
         ];
-    }
-}
-
-// ─── Terminal management ──────────────────────────────────────────────────────
-
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  TERMINAL & COMMAND EXECUTION                                      ║
-// ╚══════════════════════════════════════════════════════════════════╝
-function getTerm(name) {
-    const reuse = cfg('reuseTerminal');
-    if (reuse && terms[name] && terms[name].exitStatus === undefined) {
-        return terms[name];
-    }
-    if (terms[name]) {
-        try { terms[name].dispose(); } catch {}
-        delete terms[name];
-    }
-    const shellPath = getUserShell();
-    const options = { name, shellPath };
-    if (IS_WIN && shellPath.toLowerCase().includes('powershell') && cfg('useExecutionPolicyBypass')) {
-        options.shellArgs =['-ExecutionPolicy', 'Bypass', '-NoLogo', '-NoProfile'];
-    }
-    const t = vscode.window.createTerminal(options);
-    terms[name] = t;
-    return t;
-}
-
-function buildCmd(parts) {
-    return IS_WIN ? parts.join('; ') : parts.join(' && ');
-}
-
-// ─── IDF env prefix ──────────────────────────────────────────────────────────
-function buildIdfEnvPrefix(idfPath, pythonCmd) {
-    const py = pythonCmd || (IS_WIN ? 'python' : 'python3');
-
-    if (IS_WIN) {
-        const exportPs1 = path.join(idfPath, 'export.ps1');
-        if (fs.existsSync(exportPs1)) {
-            return `$env:IDF_PATH=${q(idfPath)}; . ${q(exportPs1)}`;
-        }
-        const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
-        return[
-            `$env:IDF_PATH=${q(idfPath)}`,
-            `${py} ${q(idfToolsPy)} export --format key-value 2>$null | Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' } | ForEach-Object { $k,$v = $_ -split '=',2; Set-Item "Env:$k" $v }`,
-        ].join('; ');
-    } else {
-        const exportSh = path.join(idfPath, 'export.sh');
-        if (fs.existsSync(exportSh)) {
-            return `export IDF_PATH=${q(idfPath)}; . ${q(exportSh)}`;
-        }
-        const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
-        return `export IDF_PATH=${q(idfPath)}; eval $(${py} ${q(idfToolsPy)} export --format shell 2>/dev/null)`;
-    }
-}
-
-// ─── Build notifications via marker file ─────────────────────────────────────
-// Lightweight watcher — just clears busy when any terminal command finishes
-function watchCommandDone(markerFile, termName) {
-    return new Promise(resolve => {
-        const started   = Date.now();
-        const maxWaitMs = 30 * 60 * 1000; // 30 min safety cap
-        const timer = setInterval(() => {
-            // Terminal was closed — release immediately
-            if (!terms[termName] || terms[termName].exitStatus !== undefined) {
-                clearInterval(timer);
-                try { fs.unlinkSync(markerFile); } catch {}
-                resolve(); clearBusy(); return;
+        for (const root of regRoots) {
+            // Перечисляем все подключи PythonCore, фильтруем те что начинаются на 3.7
+            // (может быть "3.7", "3.7-32", "3.7-64" и т.д.)
+            const subkeys = await new Promise(r =>
+                cp.exec(`reg query "${root}"`, { timeout: 3000 }, (e, stdout) => {
+                    if (e) { r([]); return; }
+                    const keys = stdout.split('\r\n')
+                        .map(l => l.trim())
+                        .filter(l => {
+                            const last = l.split('\\').pop();
+                            return last && last.startsWith('3.7');
+                        });
+                    r(keys);
+                })
+            );
+            for (const subkey of subkeys) {
+                // Читаем ExecutablePath — там уже готовый полный путь к python.exe
+                const exePath = await new Promise(r =>
+                    cp.exec(`reg query "${subkey}\\InstallPath" /v ExecutablePath`, { timeout: 3000 }, (e, stdout) => {
+                        if (e) { r(null); return; }
+                        const m = stdout.match(/ExecutablePath\s+REG_SZ\s+(.+)/);
+                        r(m ? m[1].trim() : null);
+                    })
+                );
+                if (!exePath || !fs.existsSync(exePath)) continue;
+                const ver = await getVersion(`"${exePath}"`);
+                if (ver && ver.startsWith('3.7')) return found(`"${exePath}"`, `registry:${subkey}`);
+                if (ver && !wrongVersion) wrongVersion = ver;
             }
-            // Timeout
-            if (Date.now() - started > maxWaitMs) {
-                clearInterval(timer);
-                try { fs.unlinkSync(markerFile); } catch {}
-                log(`[BUSY] command watcher timed out: ${termName}`);
-                resolve(); clearBusy(); return;
-            }
-            // Marker appeared — command finished
-            if (fs.existsSync(markerFile)) {
-                clearInterval(timer);
-                try { fs.unlinkSync(markerFile); } catch {}
-                resolve(); clearBusy();
-            }
-        }, 400);
-    });
-}
-
-function watchBuildResult(markerFile, taskName, root) {
-    return new Promise(resolve => {
-    const started   = Date.now();
-    const maxWaitMs = 15 * 60 * 1000;
-
-    const timer = setInterval(() => {
-        if (!terms[taskName] || terms[taskName].exitStatus !== undefined) {
-            clearInterval(timer);
-            try { fs.unlinkSync(markerFile); } catch {}
-            resolve(); return;
         }
-
-        if (!fs.existsSync(markerFile)) {
-            if (Date.now() - started > maxWaitMs) {
-                clearInterval(timer);
-                try { fs.unlinkSync(markerFile); } catch {}
-                log(`Build marker timed out: ${markerFile}`);
-                resolve();
-            }
-            return;
-        }
-        clearInterval(timer); resolve();
-        try {
-            const exitCode = parseInt(fs.readFileSync(markerFile, 'utf8').trim(), 10);
-            try { fs.unlinkSync(markerFile); } catch {}
-
-            if (exitCode === 0) {
-                const cc = root ? path.join(root, 'build', 'compile_commands.json') : null;
-                const hasCc = cc && fs.existsSync(cc);
-                const hint = hasCc ? ' IntelliSense updated.' : '';
-                vscode.window.showInformationMessage(`✅ ${taskName} completed.${hint}`);
-                log(`${taskName} ✅ OK`);
-
-                const analysisCmds = cfg('postBuildAnalysis') ||[];
-                analysisCmds.forEach((cmd, i) => {
-                    const titleMap = {
-                        'size':            'ESP › Size',
-                        'size-components': 'ESP › Size Components',
-                        'size-files':      'ESP › Size Files',
-                    };
-                    const title = titleMap[cmd] || `ESP › ${cmd}`;
-                    log(`Post-build analysis: idf.py ${cmd}`);
-                    setTimeout(() => runIdf([cmd], title, false), 300 * (i + 1));
-                });
-            } else {
-                vscode.window.showErrorMessage(
-                    `❌ ${taskName} failed (exit ${exitCode})`,
-                    'Show Output'
-                ).then(c => { if (c === 'Show Output') outputChannel?.show(true); });
-                log(`${taskName} ❌ failed (exit ${exitCode})`);
-            }
-        } catch (e) {
-            log(`Build marker read error: ${e.message}`);
-        }
-    }, 400);
-    }); // Promise
-}
-
-function buildMarkerCmd(markerFile) {
-    if (IS_WIN) {
-        return `; if ($LASTEXITCODE -eq 0) { '0' | Out-File -NoNewline -Encoding ASCII ${q(markerFile)} } else { '1' | Out-File -NoNewline -Encoding ASCII ${q(markerFile)} }`;
-    } else {
-        return `; _r=$?; echo $_r > ${q(markerFile)}; [ $_r -eq 0 ]`;
     }
+
+    // ── Step 4: сканируем PATH ────────────────────────────────────────────────
+    const sep      = IS_WIN ? ';' : ':';
+    const exeNames = IS_WIN ? ['python.exe'] : ['python3.7', 'python3', 'python'];
+    for (const dir of (process.env.PATH || '').split(sep)) {
+        if (!dir) continue;
+        if (IS_WIN && dir.toLowerCase().includes('windowsapps')) continue; // MS Store stub
+        if (!fs.existsSync(dir)) continue;
+
+        for (const exe of exeNames) {
+            const full = path.join(dir, exe);
+            if (!fs.existsSync(full)) continue;
+            const ver = await getVersion(`"${full}"`);
+            if (ver && ver.startsWith('3.7')) return found(`"${full}"`, `PATH scan: ${full}`);
+            if (ver && !wrongVersion) wrongVersion = ver;
+        }
+    }
+
+    // ── Step 5: ничего не нашли ───────────────────────────────────────────────
+    return notFound(wrongVersion);
 }
 
-// ─── NONOS SDK: run make command ─────────────────────────────────────────────
-
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  NONOS SDK: make / flash / monitor                                 ║
-// ╚══════════════════════════════════════════════════════════════════╝
-async function runMake(target, termName, isBuildCommand = false) {
+// ─── Pre-flight check: Python first, then project folder ─────────────────────
+// Returns true if ready. Shows appropriate error and returns false if not.
+async function requireReady() {
+    const pythonCmd = await getPythonCmd();
+    if (!pythonCmd) return false; // getPythonCmd already showed the error
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!root) {
+        vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder')
+            .then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+        return false;
+    }
+    return true;
+}
+
+async function runMake(target, termName, isBuildCommand = false) {
+    // Block if another command is already running
+    if (checkBusy()) return;
+
+    // ── Python check FIRST ───────────────────────────────────────────────────
+    const pythonCmd = await getPythonCmd();
+    if (!pythonCmd) return; // getPythonCmd already showed the error
+
+    const root = getActiveRoot();
+    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
 
     // Verify this is a valid NonOS project
     if (!fs.existsSync(path.join(root, 'Makefile'))) {
@@ -689,16 +352,7 @@ async function runMake(target, termName, isBuildCommand = false) {
         return;
     }
 
-    const pythonCmd = await getPythonCmd();
-    if (!pythonCmd) {
-        vscode.window.showErrorMessage('ESP: Python not found in PATH!');
-        return;
-    }
-
     log(`NONOS: running make ${target}`);
-
-        // Global busy guard
-    if (checkBusy()) return;
 
     let markerSuffix = '';
     setBusy(termName);
@@ -724,8 +378,12 @@ async function runMake(target, termName, isBuildCommand = false) {
 
 // ─── NONOS SDK: flash via esptool.py ─────────────────────────────────────────
 async function runNonosFlash(eraseFirst = false) {
+    // ── Python check FIRST ───────────────────────────────────────────────────
+    const pythonCmd = await getPythonCmd();
+    if (!pythonCmd) return; // getPythonCmd already showed the error
+
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
 
     let port = cfg('comPort');
     if (!port) { port = await cmdSelectPort(); if (!port) return; }
@@ -735,11 +393,13 @@ async function runNonosFlash(eraseFirst = false) {
         return;
     }
 
-    const pythonCmd = await getPythonCmd();
-    if (!pythonCmd) {
-        vscode.window.showErrorMessage('ESP: Python not found in PATH!');
-        return;
-    }
+    // ── Check port is physically available before flashing ───────────────────
+    const portHolder = { port };
+    const portOk = await confirmPortOrReselect(portHolder);
+    if (!portOk) return;
+    port = portHolder.port;
+    if (port !== cfg('comPort')) await setCfg('comPort', port);
+    // ─────────────────────────────────────────────────────────────────────────
 
     const baud     = cfg('flashBaud')      || 115200;
     const mode     = cfg('flashMode')      || 'dio';
@@ -800,18 +460,23 @@ async function runNonosFlash(eraseFirst = false) {
 }
 
 async function runNonosMonitor() {
+    const pythonCmd = await getPythonCmd();
+    if (!pythonCmd) return; // getPythonCmd already showed the error
+
     let port = cfg('comPort');
     if (!port) { port = await cmdSelectPort(); if (!port) return; }
 
-    const pythonCmd = await getPythonCmd();
-    if (!pythonCmd) {
-        vscode.window.showErrorMessage('ESP: Python not found in PATH!');
-        return;
-    }
+    // ── Check port is physically available before monitor ────────────────────
+    const portHolder = { port };
+    const portOk = await confirmPortOrReselect(portHolder);
+    if (!portOk) return;
+    port = portHolder.port;
+    if (port !== cfg('comPort')) await setCfg('comPort', port);
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Check pyserial is available
     const pyserialOk = await new Promise(r =>
-        cp.exec(`${pythonCmd} -c "import serial"`, { timeout: 5000 }, e => r(!e))
+        cp.exec(`${toExecCmd(pythonCmd)} -c "import serial"`, { timeout: 5000 }, e => r(!e))
     );
     if (!pyserialOk) {
         vscode.window.showErrorMessage(
@@ -843,8 +508,26 @@ async function runNonosMonitor() {
 // ║  RTOS SDK: idf.py runner                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
 async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {}) {
+    // Block if another command is already running
+    if (checkBusy()) return;
+
+    // ── Python check FIRST — most important for new users ────────────────────
+    const pythonCmd = await getPythonCmd(true);
+    if (!pythonCmd) return; // getPythonCmd already showed the error
+
+    // ── IDF path + tools check BEFORE project folder ─────────────────────────
+    const idfPath = getValidIdfPath();
+    if (!idfPath) {
+        vscode.window.showErrorMessage('ESP: IDF_PATH not set or invalid! Check extension settings.');
+        return;
+    }
+
+    const toolsOk = await checkToolsOrPrompt(idfPath, pythonCmd);
+    if (!toolsOk) return;
+    // ─────────────────────────────────────────────────────────────────────────
+
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
 
     // Save all unsaved files before build commands
     if (isBuildCommand) {
@@ -859,18 +542,6 @@ async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {})
 
     // Check custom partition CSV exists (if configured)
     if (!await checkPartitionCsv(root)) return;
-
-    const idfPath = getValidIdfPath();
-    if (!idfPath) {
-        vscode.window.showErrorMessage('ESP: IDF_PATH not set or invalid! Check extension settings.');
-        return;
-    }
-
-    const pythonCmd = await getPythonCmd();
-    if (!pythonCmd) {
-        vscode.window.showErrorMessage('ESP: Python not found in PATH! Please install Python.');
-        return;
-    }
 
     let finalArgs = [...args];
 
@@ -925,7 +596,8 @@ async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {})
 
     const envPrefix   = buildIdfEnvPrefix(idfPath, pythonCmd);
     const extraEnvCmd = buildEnvSetCmd(extraEnvVars);
-    const idfCmd      = `idf.py ${finalArgs.map(a => {
+    const idfPy       = path.join(idfPath, 'tools', 'idf.py');
+    const idfCmd      = `${pythonCmd} ${q(idfPy)} ${finalArgs.map(a => {
         // Quote args that contain spaces or path separators
         if (typeof a === 'string' && (a.includes(' ') || (a.includes(path.sep) && !a.startsWith('-')))) return q(a);
         return a;
@@ -973,19 +645,57 @@ function buildEnvSetCmd(envObj) {
 }
 
 async function runFlash(action = 'flash') {
+    if (checkBusy()) return;  // ← block immediately if build/install is running
+
+    // ── Python check FIRST ────────────────────────────────────────────────────
+    const pythonCmdFlash = await getPythonCmd(true);
+    if (!pythonCmdFlash) return; // getPythonCmd already showed the error
+
+    // ── Tools check BEFORE port ───────────────────────────────────────────────
+    const idfPathFlash = getValidIdfPath();
+    if (!idfPathFlash) {
+        vscode.window.showErrorMessage('ESP: IDF_PATH not set or invalid! Check extension settings.');
+        return;
+    }
+    const toolsOkFlash = await checkToolsOrPrompt(idfPathFlash, pythonCmdFlash);
+    if (!toolsOkFlash) return;
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Project folder check BEFORE port ─────────────────────────────────────
+    const rootFlash = getActiveRoot();
+    if (!rootFlash) {
+        vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder')
+            .then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+        return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const overrideFlash = cfg('overrideFlashConfig');
-    let flashArgs   =[];
+    let flashArgs   = [];
     let extraEnvVars = {};
 
+    // Port check AFTER project folder verified
+    let port = cfg('comPort');
+    if (!port) {
+        port = await cmdSelectPort();
+        if (!port) return;
+    }
+    if (port && !/^[a-zA-Z0-9./\\\\_-]+$/.test(port)) {
+        vscode.window.showErrorMessage('ESP: Invalid port name! Shell metacharacters are not allowed.');
+        return;
+    }
+
+    // ── Check port is physically available before flash or monitor ────────────
+    if (port) {
+        const portHolder = { port };
+        const ok = await confirmPortOrReselect(portHolder);
+        if (!ok) return;
+        port = portHolder.port;
+        if (port !== cfg('comPort')) await setCfg('comPort', port);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (overrideFlash) {
-        let port = cfg('comPort');
-        if (!port) { port = await cmdSelectPort(); if (!port) return; }
-
-        if (!/^[a-zA-Z0-9./\\\\_-]+$/.test(port)) {
-            vscode.window.showErrorMessage('ESP: Invalid port name! Shell metacharacters are not allowed.');
-            return;
-        }
-
         const baud        = cfg('flashBaud')           || 115200;
         const mode        = cfg('flashMode')           || 'dio';
         const freq        = cfg('flashFreq')           || '40m';
@@ -994,13 +704,16 @@ async function runFlash(action = 'flash') {
         const beforeFlash = cfg('beforeFlashing')      || 'default_reset';
         const afterFlash  = cfg('afterFlashing')       || 'hard_reset';
 
-        flashArgs =[
+        flashArgs = [
             '-p', port, '-b', String(baud),
             '--flash_mode', mode, '--flash_freq', freq, '--flash_size', size,
             compressed ? '-z' : '-u',
             '--before', beforeFlash, '--after', afterFlash
         ];
+    } else if (port) {
+        flashArgs = ['-p', port];
     }
+
 
     const isMonitor  = action.endsWith('_monitor');
     const baseAction = isMonitor ? action.replace('_monitor', '') : action;
@@ -1008,11 +721,9 @@ async function runFlash(action = 'flash') {
     let title = '';
 
     if (baseAction === 'monitor') {
-        if (overrideFlash) {
-            let port = cfg('comPort');
-            if (!port) { port = await cmdSelectPort(); if (!port) return; }
-            const monitorBaud = cfg('monitorBaud') || 74880;
-            args =['-p', port, '-b', String(monitorBaud), 'monitor'];
+        const monitorBaud = cfg('monitorBaud') || 74880;
+        if (port) {
+            args = ['-p', port, '-b', String(monitorBaud), 'monitor'];
         } else {
             args = ['monitor'];
         }
@@ -1070,44 +781,373 @@ function cmdStopMonitor() {
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  HOTPLUG: Port Detection                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
+// ─── Check SDK installation ───────────────────────────────────────────────────
+// Returns idfPath if valid, null if not found
+function checkSdkInstalled() {
+    return getValidIdfPath();
+}
+
+// ─── Full environment check: python → sdk → tools ──────────────────────
+// Shows warnings in tree AND one-time popup dialog
+// silent=true: only update tree warnings, no popups
+async function checkEnvironment(silent = false) {
+    const warnings = [];
+
+    // 1. Check Python 3.7 (first — most important for beginners)
+    const pythonCmd = await getPythonCmd(true, silent); // force — silent on startup
+    if (!pythonCmd) {
+        warnings.push({
+            label: '⚠️ Python 3.7 not found',
+            tooltip: 'Python 3.7 is required for ESP8266 SDK\nClick to download Python 3.7',
+            command: 'esp.fixPython',
+        });
+    }
+
+
+    // No SDK warning — user uses RTOS IDF / NonOS SDK buttons in SDK Path Settings
+
+    // Update tree warnings
+    if (provider) provider.setEnvWarnings(warnings);
+
+    if (warnings.length === 0) return true;
+
+    // Show popup only if not silent
+    if (!silent) {
+        const firstWarning = warnings[0];
+        const label = firstWarning.label.replace('⚠️ ', '');
+        const ans = await vscode.window.showErrorMessage(
+            `ESP-IDF: ${label}. See sidebar for details.`,
+            'Fix Now'
+        );
+        if (ans === 'Fix Now') {
+            vscode.commands.executeCommand(firstWarning.command);
+        }
+    }
+
+    return false;
+}
+
+// ─── Fix commands triggered from tree warnings ────────────────────────────────
+
+async function cmdFixPython() {
+    vscode.env.openExternal(vscode.Uri.parse('https://www.python.org/downloads/release/python-379/'));
+}
+
+async function cmdFixSdk(forceType = null) {
+    let isRtos;
+
+    if (forceType !== null) {
+        // Called directly from sidebar — type already known
+        isRtos = forceType;
+    } else {
+        // Called from warning / command palette — ask which SDK
+        const sdkType = await vscode.window.showQuickPick(
+            [
+                { label: '$(tools) RTOS SDK',    description: 'ESP8266_RTOS_SDK  —  idf.py build', value: 'rtos'  },
+                { label: '$(package) NonOS SDK', description: 'ESP8266_NONOS_SDK  —  make build',  value: 'nonos' },
+            ],
+            { title: 'ESP8266: Select SDK Type', placeHolder: 'Which SDK do you want to set up?' }
+        );
+        if (!sdkType) return;
+        isRtos = sdkType.value === 'rtos';
+    }
+
+    const cfgKey  = isRtos ? 'idfPath' : 'nonosSdkPath';
+    const sdkName = isRtos ? 'RTOS SDK' : 'NonOS SDK';
+    const envVar  = isRtos ? 'IDF_PATH' : 'SDK_PATH';
+
+    const action = await vscode.window.showQuickPick(
+        [
+            { label: '$(folder-opened) Select existing SDK folder', description: 'Already downloaded — just point to it', value: 'set' },
+            { label: '$(x) Reset', description: `Use ${envVar} environment variable`, value: 'reset' },
+        ],
+        { title: `ESP8266: Setup ${sdkName}`, placeHolder: 'How do you want to set up the SDK?' }
+    );
+    if (!action) return;
+
+    // ── Reset ──────────────────────────────────────────────────────────────────
+    if (action.value === 'reset') {
+        await setCfg(cfgKey, '');
+        vscode.window.showInformationMessage(`ESP: ${sdkName} reset → using ${envVar} from environment`);
+        return;
+    }
+
+    // ── Set existing folder ────────────────────────────────────────────────────
+    if (action.value === 'set') {
+        const folder = await vscode.window.showOpenDialog({
+            canSelectFolders: true, canSelectFiles: false,
+            openLabel: `Select ${sdkName} folder`
+        });
+        if (!folder?.[0]) return;
+        const selected = folder[0].fsPath;
+
+        // Validate
+        if (isRtos && !fs.existsSync(path.join(selected, 'tools', 'idf_tools.py'))) {
+            const ok = await vscode.window.showWarningMessage(
+                'idf_tools.py not found — does not look like RTOS SDK. Use anyway?', 'Yes', 'Cancel'
+            );
+            if (ok !== 'Yes') return;
+        }
+        if (!isRtos && (!fs.existsSync(path.join(selected, 'include')) || !fs.existsSync(path.join(selected, 'lib')))) {
+            const ok = await vscode.window.showWarningMessage(
+                'include/ or lib/ not found — does not look like NonOS SDK. Use anyway?', 'Yes', 'Cancel'
+            );
+            if (ok !== 'Yes') return;
+        }
+        if (isRtos && !IS_WIN && !fs.existsSync(path.join(selected, 'export.sh'))) {
+            vscode.window.showWarningMessage('ESP: export.sh not found — IDF environment may not activate automatically.');
+        }
+
+        _idfPathOverride = isRtos ? selected : null;
+        _nonosSdkOverride = isRtos ? null : selected;
+        await setCfg(cfgKey, selected);
+        if (isRtos) { ensureVersionTxt(selected); _pythonCmd = null; _toolsVerified = false; }
+        provider.refresh();
+        vscode.window.showInformationMessage(`✅ ${sdkName} → ${selected}`);
+        checkEnvironment(true);
+        if (isRtos) checkAndInstallTools();
+        return;
+    }
+}
+
+// ─── Check tools before command, prompt to install if missing ────────────────
+// Returns true if tools are ready, false if missing (user must install first)
+async function checkToolsOrPrompt(idfPath, pythonCmd) {
+    // Fast path — already verified this session (reset on SDK/Python change)
+    if (_toolsVerified) return true;
+
+    const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
+    if (!fs.existsSync(idfToolsPy)) { _toolsVerified = true; return true; } // can't check — allow command
+
+    return new Promise(resolve => {
+        cp.exec(
+            `${toExecCmd(pythonCmd)} "${idfToolsPy}" check`,
+            { env: { ...process.env, IDF_PATH: idfPath } },
+            async (err, stdout, stderr) => {
+                const toolsMissing = err || (stderr && stderr.includes('ERROR:'));
+                if (!toolsMissing) {
+                    _toolsVerified = true; // ✅ cache result — skip subprocess on next command
+                    resolve(true);
+                    return;
+                }
+
+                // Parse which tools are missing from idf_tools.py check output
+                // Format: "ERROR: The following required tools were not found: mconf ninja idf-exe mkspiffs"
+                const combined = (stdout || '') + (stderr || '');
+                const match = combined.match(/ERROR:\s+The following required tools were not found:\s*(.+)/i);
+                const missingList = match ? match[1].trim() : '';
+                const detail = missingList
+                    ? `Missing tools: ${missingList}`
+                    : 'Run "Install Tools" to set up the build environment.';
+
+                // Tools missing — show blocking prompt
+                const ans = await vscode.window.showErrorMessage(
+                    missingList
+                        ? `⚠️ ESP-IDF: Build tools not found (${missingList}). Install them first?`
+                        : '⚠️ ESP-IDF: Build tools are not installed. Install them first?',
+                    'Install Now', 'Cancel'
+                );
+
+                if (ans === 'Install Now') {
+                    // Verify Python still available before starting install
+                    const freshPython = await getPythonCmd(true);
+                    if (!freshPython) {
+                        const a = await vscode.window.showErrorMessage(
+                            'ESP: Python not found! Please install Python 3.7 first.',
+                            'Download Python 3.7'
+                        );
+                        if (a === 'Download Python 3.7') {
+                            vscode.env.openExternal(vscode.Uri.parse('https://www.python.org/downloads/release/python-379/'));
+                        }
+                        resolve(false);
+                        return;
+                    }
+
+                    const t = getTerm('ESP › Install Tools');
+                    t.show(true);
+                    setBusy('Installing Tools');
+
+                    const markerFile = path.join(os.tmpdir(), `esp_install_${Date.now()}.tmp`);
+                    const reqTxt = path.join(idfPath, 'requirements.txt');
+
+                    // Block if pip missing — no point running install without it
+                    const pipOk = await checkPip(freshPython);
+                    if (!pipOk) { clearBusy(); resolve(false); return; }
+
+                    const parts = IS_WIN
+                        ? [
+                            `$env:IDF_PATH=${q(idfPath)}`,
+                            `${pythonCmd} ${q(idfToolsPy)} install`,
+                            ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
+                          ]
+                        : [
+                            `export IDF_PATH=${q(idfPath)}`,
+                            `${pythonCmd} ${q(idfToolsPy)} install`,
+                            ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
+                            ];
+                    t.sendText(buildCmd(parts) + buildMarkerCmd(markerFile));
+
+                    watchCommandDone(markerFile, 'ESP › Install Tools').then(() => {
+                        _toolsVerified = true; // ✅ mark as verified after successful install
+                        clearBusy();
+                        vscode.window.showInformationMessage('✅ ESP-IDF tools installed! You can now run Build.');
+                    });
+                }
+                resolve(false); // block the command regardless — install or cancel
+            }
+        );
+    });
+}
+
+// ─── Patch tools.json — add mkspiffs if missing ───────────────────────────────
+// ─── Find mkspiffs binary in ~/.espressif/tools/mkspiffs/ ────────────────────
+function getMkspiffsCmd() {
+    const espressifBase = path.join(os.homedir(), '.espressif', 'tools', 'mkspiffs');
+    if (!fs.existsSync(espressifBase)) return null;
+    const versions = fs.readdirSync(espressifBase).filter(v =>
+        fs.statSync(path.join(espressifBase, v)).isDirectory()
+    );
+    if (!versions.length) return null;
+    const versionDir = path.join(espressifBase, versions[0]);
+    const exe = IS_WIN ? 'mkspiffs.exe' : 'mkspiffs';
+    // Check direct location first, then one level of subdirectory
+    const direct = path.join(versionDir, exe);
+    if (fs.existsSync(direct)) return direct;
+    for (const sub of fs.readdirSync(versionDir)) {
+        const subPath = path.join(versionDir, sub, exe);
+        if (fs.existsSync(subPath)) return subPath;
+    }
+    return null;
+}
+
+function patchToolsJson(idfPath) {
+    const toolsJsonPath = path.join(idfPath, 'tools', 'tools.json');
+    if (!fs.existsSync(toolsJsonPath)) return;
+
+    let toolsJson;
+    try { toolsJson = JSON.parse(fs.readFileSync(toolsJsonPath, 'utf8')); }
+    catch { return; }
+
+    // Already patched?
+    if (toolsJson.tools.some(t => t.name === 'mkspiffs')) return;
+
+    const mkspiffsEntry = {
+        description: "Tool to create SPIFFS images",
+        export_paths: [[""]],
+        export_vars: {},
+        info_url: "https://github.com/igrr/mkspiffs",
+        install: "on_request",
+        license: "MIT",
+        name: "mkspiffs",
+        platform_overrides: [
+            {
+                install: "always",
+                export_paths: [["mkspiffs-0.2.3-esp-idf-win32"]],
+                platforms: ["win32", "win64"]
+            }
+        ],
+        version_cmd: ["mkspiffs", "--version"],
+        version_regex: "mkspiffs ver\\.\\s*([0-9.]+)",
+        versions: [{
+            name: "0.2.3",
+            status: "recommended",
+            "win32": {
+                sha256: "deaf940e58da4d51337b1df071c38647f9e1ea35bcf14ce7004e246175f37c9e",
+                size: 249820,
+                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-win32.zip"
+            },
+            "win64": {
+                sha256: "deaf940e58da4d51337b1df071c38647f9e1ea35bcf14ce7004e246175f37c9e",
+                size: 249820,
+                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-win32.zip"
+            },
+            "linux-amd64": {
+                sha256: "aa56bd38a65b3de6c68468f5ea9d7f8d207b319a549e3fc59946b2b7e984c9d9",
+                size: 50635,
+                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-linux64.tar.gz"
+            },
+            "linux-i686": {
+                sha256: "d01bac03912bb21b9f96a609e88400ce4803607f80353fc8dfc52d471c1c5a88",
+                size: 48739,
+                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-linux32.tar.gz"
+            },
+            "macos": {
+                sha256: "0dc927b30759130c82943141d7fa06afab0f75fbccbf43d51b498485610945c8",
+                size: 130245,
+                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-osx.tar.gz"
+            }
+        }]
+    };
+
+    toolsJson.tools.push(mkspiffsEntry);
+
+    try {
+        fs.writeFileSync(toolsJsonPath, JSON.stringify(toolsJson, null, 2), 'utf8');
+    } catch (e) {
+    }
+}
+
 async function checkAndInstallTools() {
-    const idfPath = expandHome(cfg('idfPath'));
+    // Use getValidIdfPath() so env var IDF_PATH is also considered
+    const idfPath = getValidIdfPath();
     if (!idfPath) return;
 
     const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
     if (!fs.existsSync(idfToolsPy)) return;
 
-    const pythonCmd = await getPythonCmd();
-    if (!pythonCmd) {
-        vscode.window.showErrorMessage('ESP-IDF: Python not found. Please install Python.');
-        return;
-    }
+    const pythonCmd = await getPythonCmd(false, true); // silent — startup background check
+    if (!pythonCmd) return;
 
     return new Promise(resolve => {
         cp.exec(
-            `${pythonCmd} "${idfToolsPy}" check`,
+            `${toExecCmd(pythonCmd)} "${idfToolsPy}" check`,
             { env: { ...process.env, IDF_PATH: idfPath } },
-            async (err) => {
-                if (err) {
-                    const ans = await vscode.window.showInformationMessage(
-                        'ESP-IDF: Required build tools are not installed. Download and install now?',
-                        'Install', 'Cancel'
-                    );
+            async (err, stdout, stderr) => {
+                const toolsMissing = err || (stderr && stderr.includes('ERROR:'));
+                if (toolsMissing) {
+                    // Parse which tools are missing
+                    // Format: "ERROR: The following required tools were not found: mconf ninja idf-exe mkspiffs"
+                    const combined = (stdout || '') + (stderr || '');
+                    const match = combined.match(/ERROR:\s+The following required tools were not found:\s*(.+)/i);
+                    const missingList = match ? match[1].trim() : '';
+                    const msg = missingList
+                        ? `ESP-IDF: Required build tools not found (${missingList}). Install now?`
+                        : 'ESP-IDF: Required build tools are not installed. Install now?';
+
+                    const ans = await vscode.window.showInformationMessage(msg, 'Install', 'Cancel');
                     if (ans === 'Install') {
+                        // Block if pip missing
+                        const pipOk = await checkPip(pythonCmd);
+                        if (!pipOk) { clearBusy(); resolve(); return; }
+
                         const t = getTerm('ESP › Install Tools');
                         t.show(true);
+
+                        // Lock all commands while installing
+                        setBusy('Installing Tools');
+
+                        const markerFile = path.join(os.tmpdir(), `esp_install_${Date.now()}.tmp`);
+                        const marker = buildMarkerCmd(markerFile);
+
+                        const reqTxt = path.join(idfPath, 'requirements.txt');
                         const parts = IS_WIN
                             ?[
                                 `$env:IDF_PATH=${q(idfPath)}`,
                                 `${pythonCmd} ${q(idfToolsPy)} install`,
-                                `${pythonCmd} ${q(idfToolsPy)} install-python-env`,
-                            ]
+                                ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
+                                ]
                             :[
                                 `export IDF_PATH=${q(idfPath)}`,
                                 `${pythonCmd} ${q(idfToolsPy)} install`,
-                                `${pythonCmd} ${q(idfToolsPy)} install-python-env`,
+                                ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
                             ];
-                        t.sendText(buildCmd(parts));
+                        t.sendText(buildCmd(parts) + marker);
+
+                        // Watch for completion and unlock
+                        watchCommandDone(markerFile, 'ESP › Install Tools').then(() => {
+                            clearBusy();
+                            vscode.window.showInformationMessage('✅ ESP-IDF tools installed successfully!');
+                        });
                     }
                 }
                 resolve();
@@ -1204,14 +1244,639 @@ function stopHotplug() {
     if (_hotplugPollTimer) { clearInterval(_hotplugPollTimer); _hotplugPollTimer = null; }
 }
 
+// ─── Global busy lock ────────────────────────────────────────────────────────
+function setBusy(name) {
+    _globalBusy     = true;
+    _globalBusyName = name;
+    vscode.commands.executeCommand('setContext', 'esp.busy', true);
+    if (_statusBarBusy) {
+        _statusBarBusy.text            = `$(sync~spin) ESP: ${name}`;
+        _statusBarBusy.tooltip         = `ESP: running — ${name}\nAll commands are locked until finished\nClick to open terminal`;
+        _statusBarBusy.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        _statusBarBusy.show();
+    }
+    log(`[BUSY] locked by: ${name}`);
+}
+
+function clearBusy() {
+    _globalBusy     = false;
+    _globalBusyName = '';
+    vscode.commands.executeCommand('setContext', 'esp.busy', false);
+    if (_statusBarBusy) {
+        _statusBarBusy.hide();
+        _statusBarBusy.backgroundColor = undefined;
+    }
+    log('[BUSY] released');
+}
+
+function checkBusy() {
+    if (_globalBusy) {
+        vscode.window.showWarningMessage(
+            `ESP: "${_globalBusyName}" is running. Wait for it to finish.`,
+            'Show Terminal'
+        ).then(c => { if (c === 'Show Terminal') vscode.commands.executeCommand('workbench.action.terminal.focus'); });
+        return true;
+    }
+    return false;
+}
+
+// ─── Status Bar ───────────────────────────────────────────────────────────────
+function createStatusBar(ctx) {
+    // Busy indicator — priority 101 → appears to the LEFT of port item
+    _statusBarBusy = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
+    _statusBarBusy.command = 'workbench.action.terminal.focus';
+    ctx.subscriptions.push(_statusBarBusy);
+
+    _statusBarPort = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    _statusBarPort.command = 'esp.selectPort';
+    ctx.subscriptions.push(_statusBarPort);
+    refreshStatusBar();
+}
+
+function refreshStatusBar() {
+    if (!_statusBarPort) return;
+    const port          = cfg('comPort');
+    const overrideFlash = cfg('overrideFlashConfig');
+    const modeLabel     = overrideFlash ? 'Manual' : 'Menuconfig';
+    if (port) {
+        _statusBarPort.text            = `$(plug) ${port}`;
+        _statusBarPort.tooltip         = `ESP port: ${port} [${modeLabel} mode]\nClick to change port`;
+        _statusBarPort.backgroundColor = undefined;
+    } else {
+        _statusBarPort.text            = `$(plug) No port`;
+        _statusBarPort.tooltip         = `ESP: No port selected  [${modeLabel} mode]\nClick to select port`;
+        _statusBarPort.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    }
+    _statusBarPort.show();
+}
+
+// ─── Compiler path detection for IntelliSense ────────────────────────────────
+function findXtensaGcc() {
+    const espressifTools = path.join(os.homedir(), '.espressif', 'tools');
+    const xtensaRoot = path.join(espressifTools, 'xtensa-lx106-elf');
+    if (!fs.existsSync(xtensaRoot)) return '';
+    try {
+        const gccBin = IS_WIN ? 'xtensa-lx106-elf-gcc.exe' : 'xtensa-lx106-elf-gcc';
+        const versions = fs.readdirSync(xtensaRoot)
+            .filter(d => fs.statSync(path.join(xtensaRoot, d)).isDirectory())
+            .sort().reverse();
+        for (const ver of versions) {
+            const candidate = path.join(xtensaRoot, ver, 'bin', gccBin);
+            if (fs.existsSync(candidate)) { log(`Found xtensa gcc: ${candidate}`); return candidate; }
+        }
+    } catch { /* ignore */ }
+    return '';
+}
+
+// ─── Terminal management ──────────────────────────────────────────────────────
+function getTerm(name) {
+    const reuse = cfg('reuseTerminal');
+    if (reuse && terms[name] && terms[name].exitStatus === undefined) {
+        return terms[name];
+    }
+    if (terms[name]) {
+        try { terms[name].dispose(); } catch {}
+        delete terms[name];
+    }
+    const shellPath = getUserShell();
+    const options = { name, shellPath };
+    if (IS_WIN && shellPath.toLowerCase().includes('powershell') && cfg('useExecutionPolicyBypass')) {
+        options.shellArgs = ['-ExecutionPolicy', 'Bypass', '-NoLogo', '-NoProfile'];
+    }
+    const t = vscode.window.createTerminal(options);
+    terms[name] = t;
+    return t;
+}
+
+function buildCmd(parts) {
+    return IS_WIN ? parts.join('; ') : parts.join(' && ');
+}
+
+// ─── IDF env prefix ───────────────────────────────────────────────────────────
+// ─── Collect all bin/ paths from ~/.espressif/tools/ ─────────────────────────
+// ─── Create version.txt if missing or content invalid ────────────────────────
+// idf_tools.py parses it with: re.search(r'v([0-9]+\.[0-9]+).*', content)
+// So valid content must start with e.g. "v5.1" or "v3.2.1"
+function ensureVersionTxt(idfPath) {
+    if (!idfPath || !fs.existsSync(idfPath)) return;
+    const versionFile = path.join(idfPath, 'version.txt');
+
+    let needsWrite = false;
+    if (!fs.existsSync(versionFile)) {
+        needsWrite = true;
+    } else {
+        // Read first 16 bytes — enough to check format
+        const head = fs.readFileSync(versionFile, 'utf8').slice(0, 16).trim();
+        // Valid if matches idf_tools.py regex: v<digits>.<digits>
+        needsWrite = !/^v\d+\.\d+/.test(head);
+    }
+
+    if (needsWrite) {
+        try {
+            fs.writeFileSync(versionFile, 'v5.1');
+            log(`[version.txt] Written 'v5.1' to: ${versionFile}`);
+        } catch (e) {
+            log(`[version.txt] Failed to write: ${e.message}`);
+        }
+    }
+}
+
+function buildIdfEnvPrefix(idfPath, pythonCmd) {
+    const py = pythonCmd || (IS_WIN ? 'python' : 'python3');
+    if (IS_WIN) {
+        const exportPs1 = path.join(idfPath, 'export.ps1');
+        if (fs.existsSync(exportPs1)) {
+            return `$env:IDF_PATH=${q(idfPath)}; . ${q(exportPs1)}`;
+        }
+        const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
+        return [
+            `$env:IDF_PATH=${q(idfPath)}`,
+            `try { ${py} ${q(idfToolsPy)} export --format key-value 2>$null | Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' } | ForEach-Object { $k,$v = $_ -split '=',2; if ($k -eq 'PATH') { $env:PATH = ($v -replace [regex]::Escape('%PATH%'), $env:PATH) } else { Set-Item "Env:$k" $v } } } catch {}`,
+        ].filter(Boolean).join('; ');
+    } else {
+        const exportSh = path.join(idfPath, 'export.sh');
+        if (fs.existsSync(exportSh)) {
+            return `export IDF_PATH=${q(idfPath)}; . ${q(exportSh)}`;
+        }
+        const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
+        return `export IDF_PATH=${q(idfPath)}; eval $(${py} ${q(idfToolsPy)} export --format shell 2>/dev/null) 2>/dev/null || true;`;
+    }
+}
+
+// ─── Build notifications via marker file ─────────────────────────────────────
+// Lightweight watcher — just resolves/clearBusy when terminal command finishes
+function watchCommandDone(markerFile, termName) {
+    return new Promise(resolve => {
+        const started   = Date.now();
+        const maxWaitMs = 30 * 60 * 1000; // 30 min safety cap
+        const timer = setInterval(() => {
+            // Terminal was closed — release immediately
+            if (!terms[termName] || terms[termName].exitStatus !== undefined) {
+                clearInterval(timer);
+                try { fs.unlinkSync(markerFile); } catch {}
+                resolve(); clearBusy(); return;
+            }
+            // Timeout
+            if (Date.now() - started > maxWaitMs) {
+                clearInterval(timer);
+                try { fs.unlinkSync(markerFile); } catch {}
+                log(`[BUSY] command watcher timed out: ${termName}`);
+                resolve(); clearBusy(); return;
+            }
+            // Marker appeared — command finished
+            if (fs.existsSync(markerFile)) {
+                clearInterval(timer);
+                try { fs.unlinkSync(markerFile); } catch {}
+                resolve(); clearBusy();
+            }
+        }, 400);
+    });
+}
+
+function watchBuildResult(markerFile, taskName, root) {
+    const started   = Date.now();
+    const maxWaitMs = 15 * 60 * 1000;
+    return new Promise(resolve => {
+    const timer = setInterval(() => {
+        if (!terms[taskName] || terms[taskName].exitStatus !== undefined) {
+            clearInterval(timer);
+            try { fs.unlinkSync(markerFile); } catch {}
+            resolve(); return;
+        }
+        if (!fs.existsSync(markerFile)) {
+            if (Date.now() - started > maxWaitMs) {
+                clearInterval(timer);
+                try { fs.unlinkSync(markerFile); } catch {}
+                log(`Build marker timed out: ${markerFile}`);
+                resolve();
+            }
+            return;
+        }
+        clearInterval(timer);
+        try {
+            const exitCode = parseInt(fs.readFileSync(markerFile, 'utf8').trim(), 10);
+            try { fs.unlinkSync(markerFile); } catch {}
+            if (exitCode === 0) {
+                const cc = root ? path.join(root, 'build', 'compile_commands.json') : null;
+                const hasCc = cc && fs.existsSync(cc);
+                const hint = hasCc ? ' IntelliSense updated.' : '';
+                vscode.window.showInformationMessage(`✅ ${taskName} completed.${hint}`);
+                log(`${taskName} ✅ OK`);
+                const analysisCmds = cfg('postBuildAnalysis') || [];
+                analysisCmds.forEach((cmd, i) => {
+                    const titleMap = { 'size': 'ESP › Size', 'size-components': 'ESP › Size Components', 'size-files': 'ESP › Size Files' };
+                    setTimeout(() => runIdf([cmd], titleMap[cmd] || `ESP › ${cmd}`, false), 300 * (i + 1));
+                });
+            } else {
+                vscode.window.showErrorMessage(
+                    `❌ ${taskName} failed (exit ${exitCode})`, 'Show Output'
+                ).then(c => { if (c === 'Show Output') outputChannel?.show(true); });
+                log(`${taskName} ❌ failed (exit ${exitCode})`);
+            }
+        } catch (e) {
+            log(`Build marker read error: ${e.message}`);
+        }
+        resolve();
+    }, 400);
+    });
+}
+
+function buildMarkerCmd(markerFile) {
+    if (IS_WIN) {
+        return `; if ($LASTEXITCODE -eq 0) { '0' | Out-File -NoNewline -Encoding ASCII ${q(markerFile)} } else { '1' | Out-File -NoNewline -Encoding ASCII ${q(markerFile)} }`;
+    } else {
+        return `; _r=$?; echo $_r > ${q(markerFile)}; [ $_r -eq 0 ]`;
+    }
+}
+
+// ─── Set Python 3.7 path (Manual Toolpath Settings) ──────────────────────────
+async function cmdSetPythonPath() {
+    const current = cfg('pythonPath') || '';
+    const items = [
+        {
+            label: '$(search)  Auto-detect',
+            description: 'Search automatically via PATH / Python Launcher',
+            value: 'auto'
+        },
+        {
+            label: '$(folder)  Select folder...',
+            description: current ? `Current: ${current}` : 'Specify Python 3.7 installation folder',
+            value: 'folder'
+        }
+    ];
+
+    const picked = await vscode.window.showQuickPick(items, {
+        title: 'ESP-IDF Tools › Python 3.7 Path',
+        placeHolder: current ? `Manual: ${current}` : 'Currently: auto-detect',
+        ignoreFocusOut: true,
+    });
+    if (!picked) return;
+
+    if (picked.value === 'auto') {
+        await setCfg('pythonPath', '');
+        _pythonCmd = null; _toolsVerified = false;
+        if (provider) provider.refresh();
+        vscode.window.showInformationMessage('ESP: Python path reset to auto-detect.');
+        checkEnvironment(true);
+        return;
+    }
+
+    const uris = await vscode.window.showOpenDialog({
+        title: 'Select folder containing python.exe (e.g. C:\\Python37-32)',
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: 'Select Python 3.7 folder',
+    });
+    if (!uris || !uris.length) return;
+
+    const folder = uris[0].fsPath;
+    await setCfg('pythonPath', folder);
+    _pythonCmd = null; _toolsVerified = false;
+    if (provider) provider.refresh();
+    vscode.window.showInformationMessage(`ESP: Python 3.7 path set to: ${folder}`);
+    // Validate the selected folder: check version + pip
+    const exePath = IS_WIN ? path.join(folder, 'python.exe') : path.join(folder, 'python3');
+    const verCheck = await new Promise(r =>
+        cp.exec(`"${exePath}" --version`, { timeout: 3000 }, (e, so, se) => {
+            const m = (so + se).match(/Python (\d+\.\d+)/);
+            r(m ? m[1] : null);
+        })
+    );
+    if (!verCheck || !verCheck.startsWith('3.7')) {
+        vscode.window.showWarningMessage(
+            verCheck
+                ? `ESP: Python ${verCheck} found in selected folder. Need 3.7.x!`
+                : `ESP: python.exe not found in: ${folder}`
+        );
+    } else {
+        await checkPip(`"${exePath}"`); // warn if pip missing
+    }
+    checkEnvironment(true);
+}
+
 // ─── Activation ──────────────────────────────────────────────────────────────
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  SIDEBAR: TreeItem classes + TreeDataProvider                      ║
+// ╚══════════════════════════════════════════════════════════════════╝
+class EspItem extends vscode.TreeItem {
+    constructor(label, opts = {}) {
+        super(label, vscode.TreeItemCollapsibleState.None);
+        this.command     = opts.command ? { command: opts.command, title: label } : undefined;
+        this.iconPath    = opts.icon    ? new vscode.ThemeIcon(opts.icon) : undefined;
+        this.description = opts.desc   || '';
+        this.tooltip     = opts.tooltip || label;
+        if (opts.contextValue) this.contextValue = opts.contextValue;
+        if (opts._compName)    this._compName    = opts._compName;
+    }
+}
+
+class EspGroup extends vscode.TreeItem {
+    constructor(id, label, children, contextValue = undefined, defaultState = vscode.TreeItemCollapsibleState.Collapsed) {
+        let state = defaultState;
+        if (globalCtx) {
+            const saved = globalCtx.workspaceState.get(`espGroupState_${id}`);
+            if (saved !== undefined) state = saved;
+        }
+        super(label, state);
+        this.id = id;
+        this._children = children;
+        if (contextValue) this.contextValue = contextValue;
+    }
+}
+
+class EspProvider {
+    constructor() {
+        this._emitter    = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._emitter.event;
+        this.envWarnings = [];
+    }
+    refresh()                 { this._emitter.fire(undefined); }
+    setEnvWarnings(warnings)  { this.envWarnings = warnings; this.refresh(); }
+    getTreeItem(el)           { return el; }
+
+    getChildren(el) {
+        if (el instanceof EspGroup) return el._children;
+        if (el) return [];
+
+        const root          = getActiveRoot();
+        const port          = cfg('comPort') || '—';
+        const configuredIdf = expandHome(cfg('idfPath'));
+        const validIdf      = getValidIdfPath();
+        const folders       = vscode.workspace.workspaceFolders || [];
+        const projectName   = root ? path.basename(root) : 'folder not found';
+
+        const projectGroup = new EspGroup('projectGroup', '📁  Project Folder', [
+            new EspItem(projectName, {
+                command: 'esp.selectProject',
+                icon:    root ? (folders.length > 1 ? 'folder-active' : 'folder') : 'error',
+                tooltip: root || 'Select project workspace folder',
+                desc:    root ? (folders.length > 1 ? 'click to change' : '') : 'click to select',
+            }),
+            ...( (() => {
+                if (!root) return [];
+                const compDir = path.join(root, 'components');
+                if (!fs.existsSync(compDir)) return [];
+                const comps = fs.readdirSync(compDir).filter(n =>
+                    fs.statSync(path.join(compDir, n)).isDirectory()
+                );
+                if (!comps.length) return [];
+                const compItems = comps.map(name => {
+                    const item = new EspItem(name, {
+                        icon:    'package',
+                        tooltip: `Component: ${name}\n${path.join(compDir, name)}`,
+                    });
+                    item.contextValue = 'componentItem';
+                    item._compName = name;
+                    return item;
+                });
+                return [ new EspGroup('componentsGroup', '📦  Components', compItems, undefined,
+                    vscode.TreeItemCollapsibleState.Expanded) ];
+            })() )
+        ]);
+        projectGroup.contextValue = 'projectFolderGroup';
+
+        const createProjectItem = new EspItem('Create New Project', {
+            command: 'esp.createProject',
+            icon: 'new-folder',
+            tooltip: 'Create a new ESP8266 project from template'
+        });
+
+        const overrideFlash = cfg('overrideFlashConfig');
+        const flashBaud   = cfg('flashBaud')            || 115200;
+        const flashMode   = cfg('flashMode')            || 'dio';
+        const flashFreq   = cfg('flashFreq')            || '40m';
+        const flashSize   = cfg('flashSize')            || '2MB';
+        const compressed  = cfg('useCompressedUpload')  ?? true;
+        const beforeFlash = cfg('beforeFlashing')       || 'default_reset';
+        const afterFlash  = cfg('afterFlashing')        || 'hard_reset';
+        const monitorBaud = cfg('monitorBaud')          || 74880;
+
+        let idfLabel   = 'not set';
+        let idfDesc    = 'click to specify';
+        let idfTooltip = 'Click to specify ESP8266_RTOS_SDK folder';
+
+        if (validIdf) {
+            idfLabel   = path.basename(validIdf);
+            idfTooltip = validIdf;
+            idfDesc    = configuredIdf ? '' : '(from environment)';
+        } else if (configuredIdf) {
+            idfLabel   = path.basename(configuredIdf);
+            idfDesc    = 'error (invalid path)';
+            idfTooltip = 'tools/idf_tools.py not found';
+        }
+
+        const manualSettings = [
+            new EspItem(`Port: ${port}`,                             { command: 'esp.selectPort',           icon: 'plug',            tooltip: 'Click to select port', desc: port === '—' ? 'not selected' : '' }),
+            new EspItem(`Baud rate: ${flashBaud}`,                   { command: 'esp.selectFlashBaud',      icon: 'dashboard',       tooltip: 'Flash speed' }),
+            new EspItem(`Flash Mode: ${flashMode}`,                  { command: 'esp.selectFlashMode',      icon: 'chip',            tooltip: 'SPI Flash mode' }),
+            new EspItem(`Flash Freq: ${flashFreq}`,                  { command: 'esp.selectFlashFreq',      icon: 'pulse',           tooltip: 'SPI Flash frequency' }),
+            new EspItem(`Flash Size: ${flashSize}`,                  { command: 'esp.selectFlashSize',      icon: 'database',        tooltip: 'SPI Flash size' }),
+            new EspItem(`Compression: ${compressed ? 'Yes' : 'No'}`, { command: 'esp.toggleCompressedUpload', icon: 'file-zip',      tooltip: 'Use compression when flashing' }),
+            new EspItem(`Before flash: ${beforeFlash}`,              { command: 'esp.selectBeforeFlashing', icon: 'debug-step-over', tooltip: 'Action before flashing' }),
+            new EspItem(`After flash: ${afterFlash}`,                { command: 'esp.selectAfterFlashing',  icon: 'debug-step-out',  tooltip: 'Action after flashing' }),
+            new EspItem(`Monitor Baud: ${monitorBaud}`,              { command: 'esp.selectMonitorBaud',    icon: 'terminal',        tooltip: 'Monitor baud rate' }),
+        ];
+
+        let sourceItem;
+        if (overrideFlash) {
+            sourceItem = new EspGroup('sourceGroup', 'Source: Manual', manualSettings, 'sourceItem', vscode.TreeItemCollapsibleState.Expanded);
+        } else {
+            sourceItem = new EspItem('Source: Menuconfig', {
+                command: 'esp.toggleOverride',
+                icon: 'settings',
+                tooltip: 'Click to switch to Manual settings',
+                contextValue: 'sourceItem'
+            });
+        }
+        if (!(sourceItem instanceof EspGroup)) {
+            sourceItem.iconPath = new vscode.ThemeIcon('settings');
+        }
+
+        const sdkType      = getActiveSdkType();
+        const sdkTypeLabel = cfg('sdkType') || 'auto';
+        const nonosSdkPath = getValidNonosSdkPath();
+        const nonosRaw     = expandHome(cfg('nonosSdkPath')) || '';
+
+        let nonosLabel   = 'not set';
+        let nonosDesc    = 'click to specify';
+        let nonosTooltip = 'Click to specify ESP8266_NONOS_SDK folder';
+        if (nonosSdkPath) {
+            nonosLabel   = path.basename(nonosSdkPath);
+            nonosTooltip = nonosSdkPath;
+            nonosDesc    = nonosRaw ? '' : '(from environment)';
+        } else if (nonosRaw) {
+            nonosLabel   = path.basename(nonosRaw);
+            nonosDesc    = 'error (invalid path)';
+            nonosTooltip = 'include/ or lib/ not found in this folder';
+        }
+
+        const sdkSwitchItem = new EspItem(`SDK: ${sdkTypeLabel.toUpperCase()}`, {
+            command: 'esp.selectSdkType',
+            icon: 'symbol-enum',
+            tooltip: `Active SDK type: ${sdkTypeLabel}\nClick to switch between RTOS / NonOS / Auto`,
+            desc: sdkType ? `→ ${sdkType}` : 'none detected',
+        });
+
+        // ── Manual Toolpath Settings ────────────────────────────────
+        const pythonManualPath = cfg('pythonPath') || '';
+        const pythonLabel = pythonManualPath
+            ? `Python 3.7: ${pythonManualPath}`
+            : 'Python 3.7: auto-detect';
+        const manualToolpathGroup = new EspGroup('manualToolpathGroup', '🔧  Tool Path Settings', [
+            new EspItem(pythonLabel, {
+                command: 'esp.setPythonPath',
+                icon:    'symbol-misc',
+                tooltip: pythonManualPath
+                    ? `Manual: ${pythonManualPath}\nClick to change or switch to auto-detect`
+                    : 'Auto-detect Python 3.7\nClick to set folder manually',
+                desc: pythonManualPath ? '' : 'auto',
+            }),
+        ]);
+
+        // ── Shared groups ───────────────────────────────────────────
+        const pathSettingsGroup = (extraItems = []) => new EspGroup('pathSettingsGroup', '🔗  SDK Path Settings', [
+            sdkSwitchItem,
+            new EspItem(`RTOS IDF: ${idfLabel}`,    { command: 'esp.selectIdf',      icon: 'folder-opened', tooltip: idfTooltip,   desc: idfDesc }),
+            new EspItem(`NonOS SDK: ${nonosLabel}`,  { command: 'esp.selectNonosSdk', icon: 'folder-opened', tooltip: nonosTooltip, desc: nonosDesc }),
+            ...extraItems,
+        ]);
+
+        const vscodeUtilitiesGroup = new EspGroup('vscodeUtilitiesGroup', '🔧  VScode Utilities', [
+            new EspItem('Generate IntelliSense', { command: 'esp.generateIntelliSense', icon: 'symbol-class', tooltip: 'Generate .vscode/c_cpp_properties.json' }),
+            new EspItem('Generate tasks.json',   { command: 'esp.generateTasks',        icon: 'tasklist',     tooltip: 'Generate .vscode/tasks.json (Ctrl+Shift+B → ESP: Build)' }),
+        ]);
+
+        // ── Env warnings (не блокируют SDK команды) ─────────────────
+        const warningItems = this.envWarnings.map(w =>
+            new EspItem(w.label, { command: w.command, icon: 'warning', tooltip: w.tooltip })
+        );
+
+        // ── No SDK ───────────────────────────────────────────────────
+        if (!validIdf && !nonosSdkPath) {
+            return [
+                createProjectItem,
+                projectGroup,
+                pathSettingsGroup(),
+                manualToolpathGroup,
+                ...warningItems,
+                new EspItem('⚠️  No SDK detected — set path above', { icon: 'warning', tooltip: 'Set ESP8266_RTOS_SDK or ESP8266_NONOS_SDK path' }),
+            ];
+        }
+
+        // ── No project folder — show full tree anyway, commands will warn ──────
+
+        // ── NonOS SDK ────────────────────────────────────────────────
+        if (sdkType === 'nonos') {
+            return [
+                createProjectItem,
+                projectGroup,
+
+                new EspGroup('buildGroup', '⚙️  Build', [
+                    new EspItem('Build', { command: 'esp.nonos.build', icon: 'tools', tooltip: 'make all'   }),
+                    new EspItem('Clean', { command: 'esp.nonos.clean', icon: 'trash', tooltip: 'make clean' }),
+                ]),
+
+                new EspGroup('flashGroup', '⚡  Flash', [
+                    new EspItem('Flash',         { command: 'esp.nonos.flash',      icon: 'zap',   tooltip: 'esptool.py write_flash' }),
+                    new EspItem('Erase & Flash', { command: 'esp.nonos.flashErase', icon: 'zap',   tooltip: 'esptool.py erase_flash + write_flash' }),
+                    new EspItem('Erase Flash',   { command: 'esp.eraseFlash',       icon: 'trash', tooltip: 'esptool.py erase_flash' }),
+                ]),
+
+                new EspGroup('monitorGroup', '🖥️  Monitor', [
+                    new EspItem('Monitor',      { command: 'esp.nonos.monitor',     icon: 'terminal',   tooltip: 'python -m serial.tools.miniterm' }),
+                    new EspItem('Stop Monitor', { command: 'esp.nonos.stopMonitor', icon: 'debug-stop', tooltip: 'Stop monitor' }),
+                ]),
+
+                new EspGroup('settingsGroup', '⚙️  Serial Source Settings', [sourceItem]),
+
+                new EspGroup('pathSettingsGroup', '🔗  SDK Path Settings', [
+                    sdkSwitchItem,
+                    new EspItem(`NonOS SDK: ${nonosLabel}`, { command: 'esp.selectNonosSdk', icon: 'folder-opened', tooltip: nonosTooltip, desc: nonosDesc }),
+                ]),
+
+                manualToolpathGroup,
+
+                new EspGroup('utilsGroup', '🛠️  Utilities', [
+                    new EspItem('Make SPIFFS',              { command: 'esp.spiffs',          icon: 'database', tooltip: 'mkspiffs — pack data/ folder into SPIFFS image' }),
+                    new EspItem('Custom Partitions', { command: 'esp.partitionEditor', icon: 'layout',   tooltip: 'Open visual partition table editor' }),
+                ]),
+                vscodeUtilitiesGroup,
+            ];
+        }
+
+        // ── RTOS SDK ─────────────────────────────────────────────────
+        return [
+            createProjectItem,
+            projectGroup,
+
+            new EspGroup('buildGroup', '⚙️  Build', [
+                new EspItem('Build',             { command: 'esp.build',           icon: 'tools',       tooltip: 'idf.py build',          contextValue: 'buildItem' }),
+                new EspItem('Build App',         { command: 'esp.buildApp',        icon: 'file-binary', tooltip: 'idf.py app',            contextValue: 'buildItem' }),
+                new EspItem('Build Bootloader',  { command: 'esp.buildBootloader', icon: 'file-binary', tooltip: 'idf.py bootloader',     contextValue: 'buildItem' }),
+                new EspItem('Build Part. Table', { command: 'esp.buildPartition',  icon: 'file-binary', tooltip: 'idf.py partition_table', contextValue: 'buildItem' }),
+            ]),
+
+            new EspGroup('flashGroup', '⚡  Flash', [
+                new EspItem('Flash',               { command: 'esp.flash',           icon: 'zap',   tooltip: 'idf.py flash',              contextValue: 'flashItem' }),
+                new EspItem('Flash App',           { command: 'esp.flashApp',        icon: 'zap',   tooltip: 'idf.py app-flash',          contextValue: 'flashItem' }),
+                new EspItem('Flash Bootloader',    { command: 'esp.flashBootloader', icon: 'zap',   tooltip: 'idf.py bootloader-flash',   contextValue: 'flashItem' }),
+                new EspItem('Flash Part. Table',   { command: 'esp.flashPartition',  icon: 'zap',   tooltip: 'idf.py partition_table-flash', contextValue: 'flashItem' }),
+                new EspItem('Flash Encrypted',     { command: 'esp.flashEncrypted',  icon: 'lock',  tooltip: 'idf.py encrypted-flash',   contextValue: 'flashItem' }),
+                new EspItem('Flash Encrypted App', { command: 'esp.flashEncApp',     icon: 'lock',  tooltip: 'idf.py encrypted-app-flash', contextValue: 'flashItem' }),
+                new EspItem('Erase Flash',         { command: 'esp.eraseFlash',      icon: 'trash', tooltip: 'idf.py erase_flash' }),
+            ]),
+
+            new EspGroup('monitorGroup', '🖥️  Monitor', [
+                new EspItem('Monitor',      { command: 'esp.monitor',     icon: 'terminal',   tooltip: 'idf.py monitor' }),
+                new EspItem('Stop Monitor', { command: 'esp.stopMonitor', icon: 'debug-stop', tooltip: 'Stop idf.py monitor' }),
+            ]),
+
+            new EspGroup('cleanGroup', '🗑️  Clean', [
+                new EspItem('Clean',      { command: 'esp.clean',     icon: 'trash',     tooltip: 'idf.py clean' }),
+                new EspItem('Full Clean', { command: 'esp.fullclean', icon: 'clear-all', tooltip: 'idf.py fullclean' }),
+            ]),
+
+            new EspGroup('analysisGroup', '📊  Analysis', [
+                new EspItem('Size',            { command: 'esp.size',           icon: 'graph', tooltip: 'idf.py size' }),
+                new EspItem('Size Components', { command: 'esp.sizeComponents', icon: 'graph', tooltip: 'idf.py size-components' }),
+                new EspItem('Size Files',      { command: 'esp.sizeFiles',      icon: 'graph', tooltip: 'idf.py size-files' }),
+            ]),
+
+            new EspGroup('settingsGroup', '⚙️  Serial Source Settings', [sourceItem]),
+
+            new EspGroup('configureGroup', '🔩  SDK Configure', [
+                new EspItem('Menuconfig',      { command: 'esp.menuconfig',  icon: 'settings-gear', tooltip: 'idf.py menuconfig\n⚠️ Requires terminal: min 80 columns × 19 rows' }),
+                new EspItem('Reconfigure',     { command: 'esp.reconfigure', icon: 'refresh',       tooltip: 'idf.py reconfigure\n⚠️ Requires terminal: min 80 columns × 19 rows' }),
+                new EspItem('Reset sdkconfig', { command: 'esp.resetConfig', icon: 'discard',       tooltip: 'Delete sdkconfig — reset to defaults on next build' }),
+            ]),
+
+            pathSettingsGroup(),
+            manualToolpathGroup,
+
+            new EspGroup('utilsGroup', '🛠️  Utilities', [
+                new EspItem('Make SPIFFS',              { command: 'esp.spiffs',          icon: 'database', tooltip: 'mkspiffs — pack data/ folder into SPIFFS image' }),
+                new EspItem('Custom Partitions', { command: 'esp.partitionEditor', icon: 'layout',   tooltip: 'Open visual partition table editor' }),
+            ]),
+            new EspGroup('experimentalGroup', '⚗️  Advanced (Experimental)', [
+                new EspItem('Erase OTA Data',     { command: 'esp.eraseOta',    icon: 'trash', tooltip: '⚠️ EXPERIMENTAL\nidf.py erase_otadata\nErase otadata partition\nMay not work on all hardware or SDK versions' }),
+                new EspItem('Read OTA Data',      { command: 'esp.readOta',     icon: 'book',  tooltip: '⚠️ EXPERIMENTAL\nidf.py read_otadata\nRead otadata partition\nMay not work on all hardware or SDK versions' }),
+                new EspItem('eFuse Common Table', { command: 'esp.efuseCommon', icon: 'table', tooltip: '⚠️ EXPERIMENTAL\nidf.py efuse_common_table\nGenerate C-source for IDF\'s eFuse fields\neFuse operations are irreversible — use with caution!' }),
+                new EspItem('eFuse Custom Table', { command: 'esp.efuseCustom', icon: 'table', tooltip: '⚠️ EXPERIMENTAL\nidf.py efuse_custom_table\nGenerate C-source for user\'s eFuse fields\neFuse operations are irreversible — use with caution!' }),
+                new EspItem('Show eFuse Table',   { command: 'esp.showEfuse',   icon: 'eye',   tooltip: '⚠️ EXPERIMENTAL\nidf.py show_efuse_table\nPrint eFuse table\nMay not work on all hardware or SDK versions' }),
+            ]),
+            vscodeUtilitiesGroup,
+        ];
+    }
+}
 
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  ACTIVATION / DEACTIVATION                                         ║
 // ╚══════════════════════════════════════════════════════════════════╝
 function activate(ctx) {
     globalCtx = ctx;
-    const provider = new EspProvider();
+    provider = new EspProvider();
 
     const folders   = vscode.workspace.workspaceFolders;
     const savedRoot = ctx.workspaceState.get('espActiveRoot');
@@ -1232,13 +1897,18 @@ function activate(ctx) {
 
     createStatusBar(ctx);
 
-    getPythonCmd().catch(() => {});
     if (IS_LINUX) checkDialoutGroup();
-    checkAndInstallTools();
     startHotplug();
     setTimeout(() => autoGenerateDevFiles(), 2000);
 
     const treeView = vscode.window.createTreeView('esp-idf-tools.projectView', { treeDataProvider: provider });
+
+    // Full environment check AFTER treeView is registered so warnings appear in tree
+    setTimeout(() => {
+        const startupIdfPath = getValidIdfPath();
+        if (startupIdfPath) ensureVersionTxt(startupIdfPath);
+        checkEnvironment(true).then(ok => { if (ok) checkAndInstallTools(); });
+    }, 500);
 
     treeView.onDidCollapseElement(e => {
         if (e.element.id) ctx.workspaceState.update(`espGroupState_${e.element.id}`, vscode.TreeItemCollapsibleState.Collapsed);
@@ -1251,13 +1921,17 @@ function activate(ctx) {
         treeView,
         vscode.workspace.onDidChangeConfiguration(e => {
             if (!e.affectsConfiguration('esp-idf-tools')) return;
-            provider.refresh();
-            refreshStatusBar();
             if (e.affectsConfiguration('esp-idf-tools.idfPath')) {
-                _pythonCmd = null;
+                if (cfg('idfPath') === _idfPathOverride) _idfPathOverride = null;
+                _pythonCmd = null; _toolsVerified = false;
                 checkAndInstallTools();
                 setTimeout(() => autoGenerateDevFiles(), 1000);
             }
+            if (e.affectsConfiguration('esp-idf-tools.nonosSdkPath')) {
+                if (cfg('nonosSdkPath') === _nonosSdkOverride) _nonosSdkOverride = null;
+            }
+            provider.refresh();
+            refreshStatusBar();
         }),
         vscode.workspace.onDidChangeWorkspaceFolders(() => {
             const current = vscode.workspace.workspaceFolders ||[];
@@ -1319,8 +1993,8 @@ function activate(ctx) {
 
     reg('esp.createProject',  async () => { await cmdCreateProject();  provider.refresh(); });
     reg('esp.selectPort',     async () => { const p = await cmdSelectPort();  provider.refresh(); refreshStatusBar(); return p; });
-    reg('esp.selectIdf',      async () => { await cmdSelectIdf();      provider.refresh(); refreshStatusBar(); });
-    reg('esp.selectNonosSdk', async () => { await cmdSelectNonosSdk(); provider.refresh(); refreshStatusBar(); });
+    reg('esp.selectIdf',      async () => { await cmdFixSdk(true);  provider.refresh(); refreshStatusBar(); });
+    reg('esp.selectNonosSdk', async () => { await cmdFixSdk(false); provider.refresh(); refreshStatusBar(); });
     reg('esp.selectSdkType',  async () => { await cmdSelectSdkType();  provider.refresh(); refreshStatusBar(); });
     reg('esp.selectProject',  async () => { await cmdSelectProject();  provider.refresh(); });
     reg('esp.configureBuild', async () => { await cmdConfigureBuild(); provider.refresh(); });
@@ -1334,7 +2008,17 @@ function activate(ctx) {
     reg('esp.selectBeforeFlashing',    async () => { await cmdSelectBeforeFlashing();    provider.refresh(); });
     reg('esp.selectAfterFlashing',     async () => { await cmdSelectAfterFlashing();     provider.refresh(); });
     reg('esp.selectMonitorBaud',       async () => { await cmdSelectMonitorBaud();       provider.refresh(); });
-    reg('esp.refreshViews',            () => provider.refresh());
+    reg('esp.refreshViews', () => {
+        _toolsVerified = false;
+        _pythonCmd     = null;  // force re-detect python
+        const idfPath  = getValidIdfPath();
+        if (idfPath) ensureVersionTxt(idfPath);
+        provider.refresh();
+        checkEnvironment(true).then(ok => { if (ok) checkAndInstallTools(); });
+    });
+    reg('esp.fixPython',               () => cmdFixPython());
+    reg('esp.fixSdk',                  () => cmdFixSdk());
+    reg('esp.setPythonPath',           async () => { await cmdSetPythonPath(); });
     reg('esp.collapseAll',             () => vscode.commands.executeCommand('workbench.actions.treeView.esp-idf-tools.projectView.collapseAll'));
 }
 
@@ -1487,9 +2171,21 @@ function getActiveRoot() {
     return null;
 }
 
+// ── Prerequisite check: Python first, then project folder ─────────────────────
+// Returns true if all OK, false if something is missing (shows error message).
+async function checkRequirements({ needsRoot = true } = {}) {
+    const pythonCmd = await getPythonCmd();
+    if (!pythonCmd) return false; // getPythonCmd already showed the error
+    if (needsRoot && !getActiveRoot()) {
+        vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+        return false;
+    }
+    return true;
+}
+
 async function cmdGenerateIntelliSense() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!await requireReady()) return;
     const idfPath = getValidIdfPath();
     if (!idfPath) { vscode.window.showErrorMessage('ESP: IDF path not set!'); return; }
 
@@ -1557,11 +2253,11 @@ async function cmdGenerateIntelliSense() {
 
 async function cmdGenerateTasks() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!await requireReady()) return;
     const idfPath = getValidIdfPath();
     if (!idfPath) { vscode.window.showErrorMessage('ESP: IDF path not set!'); return; }
     const pythonCmd = await getPythonCmd();
-    if (!pythonCmd) { vscode.window.showErrorMessage('ESP: Python not found!'); return; }
+    if (!pythonCmd) return; // getPythonCmd already showed the error
 
     const envPrefix = buildIdfEnvPrefix(idfPath, pythonCmd);
 
@@ -1660,7 +2356,7 @@ async function cmdDeleteComponent(item) {
 
 async function cmdAddComponent() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder first!'); return; }
+    if (!await requireReady()) return;
 
     // NonOS SDK uses make, not cmake — components not supported yet
     if (getActiveSdkType() === 'nonos') {
@@ -1962,7 +2658,10 @@ output/
 // ╚══════════════════════════════════════════════════════════════════╝
 async function cmdSelectProject() {
     const folders = vscode.workspace.workspaceFolders;
-    if (!folders?.length) { vscode.window.showErrorMessage('No open folders. Use File > Open Folder.'); return; }
+    if (!folders?.length) {
+        vscode.commands.executeCommand('workbench.action.files.openFolder');
+        return;
+    }
     if (folders.length === 1) {
         activeRoot = folders[0].uri.fsPath;
         if (globalCtx) globalCtx.workspaceState.update('espActiveRoot', activeRoot);
@@ -1984,77 +2683,6 @@ async function cmdSelectProject() {
     vscode.window.showInformationMessage(`ESP: Project → ${path.basename(activeRoot)}`);
 }
 
-async function cmdSelectIdf() {
-    const current = cfg('idfPath');
-    const choice = await vscode.window.showQuickPick([
-        { label: '$(folder-opened) Select SDK folder...', description: current ? `current: ${current}` : 'not set' },
-        { label: '$(x) Reset', description: 'Use IDF_PATH environment variable' },
-    ], { title: 'ESP-IDF Tools › IDF_PATH' });
-    if (!choice) return;
-
-    if (choice.label.includes('Reset')) {
-        await setCfg('idfPath', '');
-        vscode.window.showInformationMessage('ESP: IDF_PATH reset → from environment');
-        return;
-    }
-
-    const uris = await vscode.window.showOpenDialog({
-        canSelectFiles: false, canSelectFolders: true, canSelectMany: false,
-        title: 'Select ESP8266_RTOS_SDK folder', openLabel: 'Use'
-    });
-    if (!uris?.length) return;
-    const selected = uris[0].fsPath;
-
-    if (!fs.existsSync(path.join(selected, 'tools', 'idf_tools.py'))) {
-        const ok = await vscode.window.showWarningMessage(
-            'Does not look like ESP8266_RTOS_SDK. Use anyway?', 'Yes', 'Cancel'
-        );
-        if (ok !== 'Yes') return;
-    }
-
-    if (!IS_WIN && !fs.existsSync(path.join(selected, 'export.sh'))) {
-        vscode.window.showWarningMessage(
-            'ESP: export.sh not found — IDF environment may not activate automatically.'
-        );
-    }
-
-    await setCfg('idfPath', selected);
-    _pythonCmd = null; // reset
-    vscode.window.showInformationMessage(`ESP: IDF_PATH → ${selected}`);
-}
-
-async function cmdSelectNonosSdk() {
-    const current = cfg('nonosSdkPath');
-    const choice = await vscode.window.showQuickPick([
-        { label: '$(folder-opened) Select SDK folder...', description: current ? `current: ${current}` : 'not set' },
-        { label: '$(x) Reset', description: 'Use SDK_PATH environment variable' },
-    ], { title: 'ESP-IDF Tools › ESP8266_NONOS_SDK Path' });
-    if (!choice) return;
-
-    if (choice.label.includes('Reset')) {
-        await setCfg('nonosSdkPath', '');
-        vscode.window.showInformationMessage('ESP: NONOS SDK path reset → from environment');
-        return;
-    }
-
-    const uris = await vscode.window.showOpenDialog({
-        canSelectFiles: false, canSelectFolders: true, canSelectMany: false,
-        title: 'Select ESP8266_NONOS_SDK folder', openLabel: 'Use'
-    });
-    if (!uris?.length) return;
-    const selected = uris[0].fsPath;
-
-    if (!fs.existsSync(path.join(selected, 'include')) || !fs.existsSync(path.join(selected, 'lib'))) {
-        const ok = await vscode.window.showWarningMessage(
-            'Does not look like ESP8266_NONOS_SDK (include/ or lib/ not found). Use anyway?', 'Yes', 'Cancel'
-        );
-        if (ok !== 'Yes') return;
-    }
-
-    await setCfg('nonosSdkPath', selected);
-    _pythonCmd = null;
-    vscode.window.showInformationMessage(`ESP: NONOS SDK → ${selected}`);
-}
 
 async function cmdSelectSdkType() {
     const current = cfg('sdkType') || 'auto';
@@ -2230,6 +2858,41 @@ async function cmdSelectPort() {
     return port;
 }
 
+// ─── PORT AVAILABILITY CHECK ──────────────────────────────────────────────────
+// Returns true if port is physically accessible
+function isPortAvailable(port) {
+    return new Promise(resolve => {
+        if (IS_WIN) {
+            // `mode COMx` exits 0 if port exists and not busy, non-0 if absent or locked
+            cp.exec(`mode ${port}`, { timeout: 3000 }, err => resolve(!err));
+        } else {
+            // On Linux/Mac — device file must exist
+            resolve(fs.existsSync(port));
+        }
+    });
+}
+
+// Check port, if unavailable — warn and offer to reselect.
+// portHolder = { port: 'COM3' }  (object so we can update the value)
+// Returns true → proceed with flash, false → abort
+async function confirmPortOrReselect(portHolder) {
+    const available = await isPortAvailable(portHolder.port);
+    if (available) return true;
+
+    const choice = await vscode.window.showWarningMessage(
+        `ESP: Port ${portHolder.port} is not available — device not connected?`,
+        { modal: true },
+        'Select another port'
+    );
+
+    if (choice !== 'Select another port') return false;
+
+    const newPort = await cmdSelectPort();
+    if (!newPort) return false;
+    portHolder.port = newPort;
+    return true;
+}
+
 async function detectPorts() {
     const now = Date.now();
     if (now - portCache.timestamp < 3000) return portCache.data;
@@ -2310,28 +2973,52 @@ function detectPortsMac() {
 // ╚══════════════════════════════════════════════════════════════════╝
 async function cmdMakeSpiffs() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!await requireReady()) return;
 
+    // ── 1. Check mkspiffs FIRST — no point asking about data/ if tool is missing
+    const mkspiffsCmd = getMkspiffsCmd();
+    if (!mkspiffsCmd) {
+        const idfPath = getValidIdfPath();
+        if (!idfPath) {
+            const ans = await vscode.window.showErrorMessage(
+                'mkspiffs requires ESP8266 RTOS SDK to be configured. Set up SDK first.',
+                'Set up SDK'
+            );
+            if (ans === 'Set up SDK') vscode.commands.executeCommand('esp.selectIdf');
+            return;
+        }
+        const pythonCmd = await getPythonCmd();
+        if (!pythonCmd) return;
+        // Re-patch tools.json then install
+        patchToolsJson(idfPath);
+        const ans = await vscode.window.showWarningMessage(
+            'mkspiffs not found. Install it automatically?', 'Install', 'Cancel'
+        );
+        if (ans !== 'Install') return;
+        const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
+        const t = getTerm('ESP › Install mkspiffs');
+        t.show(true);
+        setBusy('Installing mkspiffs');
+        const markerFile = path.join(os.tmpdir(), `esp_mkspiffs_${Date.now()}.tmp`);
+        t.sendText(`${pythonCmd} ${q(idfToolsPy)} install mkspiffs` + buildMarkerCmd(markerFile));
+        watchCommandDone(markerFile, 'ESP › Install mkspiffs').then(() => {
+            clearBusy();
+            vscode.window.showInformationMessage('✅ mkspiffs installed! Run Make SPIFFS again.');
+        });
+        return;
+    }
+
+    // ── 2. mkspiffs is available — now check data/ folder
     const dataDir = path.join(root, 'data');
     if (!fs.existsSync(dataDir)) {
         const ans = await vscode.window.showWarningMessage('Folder data/ not found. Create?', 'Create', 'Cancel');
         if (ans !== 'Create') return;
         fs.mkdirSync(dataDir, { recursive: true });
-        vscode.window.showInformationMessage('Folder data/ created.');
+        vscode.window.showInformationMessage('Folder data/ created. Add your files and run Make SPIFFS again.');
         return;
     }
 
-    if (!await checkCommandExists('mkspiffs')) {
-        vscode.window.showErrorMessage(
-            IS_WIN
-                ? 'mkspiffs not found. Download from github.com/igrr/mkspiffs/releases'
-                : IS_LINUX
-                    ? 'mkspiffs not found. Install: sudo apt install mkspiffs'
-                    : 'mkspiffs not found. Install: brew install mkspiffs'
-        );
-        return;
-    }
-
+    // ── 3. All good — build SPIFFS image
     const size   = cfg('spiffsSize')  || 262144;
     const block  = cfg('spiffsBlock') || 4096;
     const page   = cfg('spiffsPage')  || 256;
@@ -2340,11 +3027,12 @@ async function cmdMakeSpiffs() {
     const t = getTerm('ESP › Make SPIFFS');
     t.show(true);
 
+    const mkcmd = q(mkspiffsCmd);
     const parts = IS_WIN
         ?[`Set-Location ${q(root)}`,
-           `mkspiffs -d 5 -c ${q(dataDir)} -s ${size} -b ${block} -p ${page} ${q(outBin)}`]
+           `& ${mkcmd} -d 5 -c ${q(dataDir)} -s ${size} -b ${block} -p ${page} ${q(outBin)}`]
         :[`cd ${q(root)}`,
-           `mkspiffs -d 5 -c ${q(dataDir)} -s ${size} -b ${block} -p ${page} ${q(outBin)}`];
+           `${mkcmd} -d 5 -c ${q(dataDir)} -s ${size} -b ${block} -p ${page} ${q(outBin)}`];
     t.sendText(buildCmd(parts));
 }
 
@@ -2406,7 +3094,7 @@ function getPartitionCsvFilename(root) {
 
 async function cmdResetConfig() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!await requireReady()) return;
     if (checkBusy()) return;
 
     const sdkconfig    = path.join(root, 'sdkconfig');
@@ -2442,7 +3130,7 @@ async function cmdResetConfig() {
 // ╚══════════════════════════════════════════════════════════════════╝
 function cmdPartitionEditor() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!'); return; }
+    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
 
     // Singleton — reveal existing panel instead of opening a duplicate
     if (_partitionPanel) {
@@ -3384,10 +4072,4 @@ function parseCsvToPartitions(csv) {
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  EXPORTS                                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
-function checkCommandExists(cmd) {
-    return new Promise(resolve => {
-        cp.exec(IS_WIN ? `where ${cmd}` : `command -v ${cmd}`, { timeout: 2000 }, e => resolve(!e));
-    });
-}
-
 module.exports = { activate, deactivate };
