@@ -57,10 +57,10 @@ Generates:
 - **Custom Partitions** — open partition table editor
 
 > ### 🗂️ Partition Table Editor
-> 
->  Visual editor for ESP8266 flash partition tables.  
+>
+> Visual editor for ESP8266 flash partition tables.  
 > Drag-and-drop reordering, flash map visualization, presets, validation and CSV support.
-> 
+>
 > - Drag-and-drop partition reordering
 > - Flash map visualization
 > - **OTA preset** — auto-selects 1MB or 2MB+ layout based on flash size
