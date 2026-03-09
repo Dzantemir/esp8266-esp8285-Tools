@@ -36,6 +36,7 @@ Supports both **ESP8266_RTOS_SDK** (`idf.py`) and **ESP8266_NonOS_SDK** (`make`)
 - Shows active project name
 - **📦 Components** — automatically lists `components/` subfolders
   - `[+]` button — launch **Add Component** wizard
+  - `[✏️]` button — edit component (rename, sources, headers, dependencies)
   - `[🗑]` button — delete component with confirmation
 
 ### ➕ Add Component Wizard (RTOS SDK only)
@@ -51,6 +52,15 @@ Generates:
 - `.h` header stub (if selected)
 
 > No changes to root `CMakeLists.txt` needed — ESP-IDF SDK auto-detects `components/`
+
+### ✏️ Edit Component Wizard (RTOS SDK only)
+Edits an existing component — opens pre-filled wizard with 4 steps:
+1. **Rename** — rename the component folder (leave unchanged to skip)
+2. **Source files** — pre-filled from existing `CMakeLists.txt`
+3. **Header location** — pre-selected from existing config
+4. **REQUIRES dependencies** — pre-filled from existing config
+
+Updates `CMakeLists.txt` in place. Creates any new source files that don't exist yet.
 
 ### 🛠️ Utilities
 - **Make SPIFFS** — pack `data/` folder into SPIFFS image using `mkspiffs`
