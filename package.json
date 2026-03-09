@@ -2,7 +2,7 @@
   "name": "esp-idf-tools",
   "displayName": "ESP8266 / ESP8285 Tools",
   "description": "Build, flash, monitor and configure ESP8266/ESP8285 projects. Supports ESP8266_RTOS_SDK (idf.py) and ESP8266_NonOS_SDK.",
-  "version": "1.9.2",
+  "version": "0.9.7",
   "publisher": "Dzantemir",
   "engines": {
     "vscode": "^1.75.0"
@@ -311,6 +311,11 @@
       {
         "command": "esp.setPythonPath",
         "title": "ESP: Set Python 3.7 folder"
+      },
+      {
+        "command": "esp.editComponent",
+        "title": "ESP › Edit Component",
+        "icon": "$(edit)"
       }
     ],
     "menus": {
@@ -333,6 +338,11 @@
         {
           "command": "esp.addComponent",
           "when": "view == esp-idf-tools.projectView && viewItem == projectFolderGroup",
+          "group": "inline"
+        },
+        {
+          "command": "esp.editComponent",
+          "when": "view == esp-idf-tools.projectView && viewItem == componentItem",
           "group": "inline"
         },
         {

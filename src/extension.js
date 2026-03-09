@@ -926,8 +926,42 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
             async (err, stdout, stderr) => {
                 const toolsMissing = err || (stderr && stderr.includes('ERROR:'));
                 if (!toolsMissing) {
-                    _toolsVerified = true; // ✅ cache result — skip subprocess on next command
-                    resolve(true);
+                    // ── Also check requirements.txt are satisfied ─────────────
+                    const reqTxt = path.join(idfPath, 'requirements.txt');
+                    if (fs.existsSync(reqTxt)) {
+                        cp.exec(
+                            `${toExecCmd(pythonCmd)} -m pip check`,
+                            async (reqErr, reqOut, reqStderr) => {
+                                const combined = (reqOut || '') + (reqStderr || '');
+                                const reqMissing = reqErr || combined.toLowerCase().includes('is not installed') || combined.toLowerCase().includes('has requirement');
+                                if (reqMissing) {
+                                    const ans = await vscode.window.showWarningMessage(
+                                        'ESP-IDF: Python requirements from requirements.txt are not satisfied. Install now?',
+                                        'Install', 'Skip'
+                                    );
+                                    if (ans === 'Install') {
+                                        const t = getTerm('ESP › Install Tools');
+                                        t.show(true);
+                                        setBusy('Installing requirements');
+                                        const markerFile = path.join(os.tmpdir(), `esp_req_${Date.now()}.tmp`);
+                                        const parts = IS_WIN
+                                            ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install -r ${q(reqTxt)}`]
+                                            : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install -r ${q(reqTxt)}`];
+                                        t.sendText(buildCmd(parts) + buildMarkerCmd(markerFile));
+                                        watchCommandDone(markerFile, 'ESP › Install Tools').then(() => {
+                                            clearBusy();
+                                            vscode.window.showInformationMessage('✅ Python requirements installed!');
+                                        });
+                                    }
+                                }
+                                _toolsVerified = true;
+                                resolve(true);
+                            }
+                        );
+                    } else {
+                        _toolsVerified = true; // ✅ cache result — skip subprocess on next command
+                        resolve(true);
+                    }
                     return;
                 }
 
@@ -1753,17 +1787,7 @@ class EspProvider {
             new EspItem(w.label, { command: w.command, icon: 'warning', tooltip: w.tooltip })
         );
 
-        // ── No SDK ───────────────────────────────────────────────────
-        if (!validIdf && !nonosSdkPath) {
-            return [
-                createProjectItem,
-                projectGroup,
-                pathSettingsGroup(),
-                manualToolpathGroup,
-                ...warningItems,
-                new EspItem('⚠️  No SDK detected — set path above', { icon: 'warning', tooltip: 'Set ESP8266_RTOS_SDK or ESP8266_NONOS_SDK path' }),
-            ];
-        }
+        // ── No SDK — show full tree anyway, warning already in warningItems ──────
 
         // ── No project folder — show full tree anyway, commands will warn ──────
 
@@ -1981,6 +2005,7 @@ function activate(ctx) {
     reg('esp.spiffs',          () => cmdMakeSpiffs());
     reg('esp.addComponent',    async () => { await cmdAddComponent(); provider.refresh(); });
     reg('esp.deleteComponent', async (item) => { await cmdDeleteComponent(item); provider.refresh(); });
+    reg('esp.editComponent',   async (item) => { await cmdEditComponent(item);   provider.refresh(); });
     reg('esp.partitionEditor', () => cmdPartitionEditor());
     reg('esp.efuseCommon',     () => runIdf(['efuse_common_table'], 'ESP › eFuse Common Table'));
     reg('esp.efuseCustom',     () => runIdf(['efuse_custom_table'], 'ESP › eFuse Custom Table'));
@@ -2467,6 +2492,137 @@ async function cmdAddComponent() {
 
     } catch (e) {
         vscode.window.showErrorMessage(`ESP: Failed to create component: ${e.message}`);
+    }
+}
+
+// ─── Edit existing component ──────────────────────────────────────────────────
+async function cmdEditComponent(item) {
+    const root = getActiveRoot();
+    if (!await requireReady()) return;
+
+    const compName = item?._compName || item?.label;
+    if (!compName) { vscode.window.showErrorMessage('ESP: Cannot determine component name.'); return; }
+
+    const compDir = path.join(root, 'components', compName);
+    if (!fs.existsSync(compDir)) {
+        vscode.window.showErrorMessage(`ESP: Component folder not found: ${compDir}`);
+        return;
+    }
+
+    // Parse existing CMakeLists.txt to pre-fill wizard
+    let existingSrcs = `${compName}.c`;
+    let existingHeaderVal = 'include';
+    let existingRequires = '';
+
+    const cmakePath = path.join(compDir, 'CMakeLists.txt');
+    if (fs.existsSync(cmakePath)) {
+        const cmake = fs.readFileSync(cmakePath, 'utf8');
+
+        // Extract SRCS
+        const srcsMatch = cmake.match(/SRCS\s+((?:"[^"]*"\s*)+)/);
+        if (srcsMatch) {
+            existingSrcs = srcsMatch[1].trim().replace(/"([^"]*)"\s*/g, '$1, ').replace(/,\s*$/, '');
+        }
+
+        // Extract INCLUDE_DIRS
+        if (/INCLUDE_DIRS\s+"\."/. test(cmake))       existingHeaderVal = 'dot';
+        else if (/INCLUDE_DIRS\s+"include"/.test(cmake)) existingHeaderVal = 'include';
+        else if (!cmake.includes('INCLUDE_DIRS'))       existingHeaderVal = 'none';
+
+        // Extract REQUIRES
+        const reqMatch = cmake.match(/REQUIRES[^\S\n]+([^)\n]+)/);
+        if (reqMatch) {
+            existingRequires = reqMatch[1].trim().replace(/\s+/g, ', ');
+        }
+    }
+
+    // Step 0 — rename (optional)
+    const newNameInput = await vscode.window.showInputBox({
+        title:       `Edit Component "${compName}" — Step 1/4: Rename`,
+        prompt:      'Component folder name',
+        value:       compName,
+        validateInput: text => {
+            if (!text?.match(/^[a-zA-Z0-9_]+$/)) return 'Use letters, numbers and _ only';
+            if (text !== compName && fs.existsSync(path.join(root, 'components', text)))
+                return `Component "${text}" already exists`;
+            return null;
+        }
+    });
+    if (newNameInput === undefined) return;
+    const newName = newNameInput.trim() || compName;
+
+    // Step 1 — source files (pre-filled)
+    const srcsInput = await vscode.window.showInputBox({
+        title:       `Edit Component "${compName}" — Step 2/4: Source Files`,
+        prompt:      'Source .c files (comma-separated)',
+        value:       existingSrcs,
+    });
+    if (srcsInput === undefined) return;
+    const srcs = srcsInput.split(',').map(s => s.trim()).filter(Boolean);
+
+    // Step 2 — headers (pre-selected)
+    const headerItems = [
+        { label: '$(folder) Separate include/ folder', description: 'INCLUDE_DIRS "include"', value: 'include' },
+        { label: '$(file)   Same folder as .c files',  description: 'INCLUDE_DIRS "."',       value: 'dot'     },
+        { label: '$(x)      No header files',           description: 'no INCLUDE_DIRS',        value: 'none'    },
+    ];
+    headerItems.forEach(i => { if (i.value === existingHeaderVal) i.picked = true; });
+    const headersChoice = await vscode.window.showQuickPick(headerItems, {
+        title: `Edit Component "${compName}" — Step 3/4: Header Files`,
+        placeHolder: 'Where are the .h files?',
+    });
+    if (!headersChoice) return;
+
+    // Step 3 — REQUIRES (pre-filled)
+    const reqInput = await vscode.window.showInputBox({
+        title:       `Edit Component "${compName}" — Step 4/4: Dependencies (REQUIRES)`,
+        prompt:      'Other components this depends on (comma-separated, leave empty if none)',
+        value:       existingRequires,
+        placeHolder: 'fatfs, driver',
+    });
+    if (reqInput === undefined) return;
+    const requires = reqInput.split(',').map(s => s.trim()).filter(Boolean);
+
+    // Rebuild CMakeLists.txt
+    const srcsLine = srcs.map(s => `"${s}"`).join(' ');
+    const incLine  = headersChoice.value === 'include' ? '\n                       INCLUDE_DIRS "include"'
+                   : headersChoice.value === 'dot'     ? '\n                       INCLUDE_DIRS "."'
+                   : '';
+    const reqLine  = requires.length ? `\n                       REQUIRES ${requires.join(' ')}` : '';
+    const cmakeContent = `idf_component_register(SRCS ${srcsLine}${incLine}${reqLine}\n)\n`;
+
+    try {
+        // Rename folder if needed
+        let finalCompDir = compDir;
+        let finalCmakePath = cmakePath;
+        if (newName !== compName) {
+            const newCompDir = path.join(root, 'components', newName);
+            fs.renameSync(compDir, newCompDir);
+            finalCompDir    = newCompDir;
+            finalCmakePath  = path.join(newCompDir, 'CMakeLists.txt');
+        }
+
+        // Update CMakeLists.txt
+        fs.writeFileSync(finalCmakePath, cmakeContent);
+
+        // Create any new source files that don't exist yet
+        for (const src of srcs) {
+            const srcPath = path.join(finalCompDir, src);
+            if (!fs.existsSync(srcPath)) {
+                const baseName = src.replace(/\.c$/, '');
+                fs.writeFileSync(srcPath, `#include "${baseName}.h"\n\n// TODO: implement ${baseName}\n`);
+            }
+        }
+
+        // Create include/ folder if needed
+        if (headersChoice.value === 'include') {
+            fs.mkdirSync(path.join(finalCompDir, 'include'), { recursive: true });
+        }
+
+        const renamed = newName !== compName ? ` (renamed → "${newName}")` : '';
+        vscode.window.showInformationMessage(`✅ Component "${compName}" updated${renamed}.`);
+    } catch (e) {
+        vscode.window.showErrorMessage(`ESP: Failed to update component: ${e.message}`);
     }
 }
 

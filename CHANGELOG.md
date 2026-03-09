@@ -1,6 +1,19 @@
 # Changelog
 
-## [1.9.2]
+## [0.9.7]
+- Build: fixed requirements check — replaced `pip install --dry-run` (not supported in pip<21) with `pip check` (works with Python 3.7)
+
+- Build: added requirements.txt check before build — if Python packages not satisfied, offers to install automatically (was silently failing at idf.py build step)
+
+- Components: Edit wizard — added Step 0 "Rename" — renames the component folder (leave unchanged to skip)
+- Components: success message shows "renamed → new_name" when folder was renamed
+
+- Components: added ✏️ Edit button next to each component — opens pre-filled wizard (Source files, Header location, REQUIRES)
+- Components: Edit wizard reads existing CMakeLists.txt and pre-fills all fields
+
+- Sidebar: removed ⚠️ Python warning from tree — shown only when a command is invoked
+
+## [0.9.2]
 - Sidebar: full tree always visible even without project folder selected — commands show error only when needed
 - Check order: all commands now follow strict sequence: Python → IDF path → Tools → Project folder → Port
 - Port check dialog: removed "Flash anyway" button — only "Select another port" or Cancel
