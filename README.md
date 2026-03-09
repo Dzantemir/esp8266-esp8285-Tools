@@ -52,8 +52,15 @@ Generates:
 
 > No changes to root `CMakeLists.txt` needed — ESP-IDF SDK auto-detects `components/`
 
+### 🛠️ Utilities
+- **Make SPIFFS** — pack `data/` folder into SPIFFS image using `mkspiffs`
+- **Custom Partitions** — open partition table editor
+
 ### 🗂️ Partition Table Editor
-Visual editor for ESP8266 flash partition tables:
+
+> Visual editor for ESP8266 flash partition tables.  
+> Drag-and-drop reordering, flash map visualization, presets, validation and CSV support.
+
 - Drag-and-drop partition reordering
 - Flash map visualization
 - **OTA preset** — auto-selects 1MB or 2MB+ layout based on flash size
@@ -62,10 +69,6 @@ Visual editor for ESP8266 flash partition tables:
 - Auto Offsets — automatic offset calculation
 - Validation with ESP8266-specific checks (1MB app boundary, alignment, overlaps)
 - CSV save/open
-
-### 🛠️ Utilities
-- **Make SPIFFS** — pack `data/` folder into SPIFFS image using `mkspiffs`
-- **Custom Partitions** — open partition table editor
 
 ### ⚗️ Advanced (Experimental)
 - eFuse Common / Custom Table generation
