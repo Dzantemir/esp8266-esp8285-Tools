@@ -56,19 +56,19 @@ Generates:
 - **Make SPIFFS** — pack `data/` folder into SPIFFS image using `mkspiffs`
 - **Custom Partitions** — open partition table editor
 
-### 🗂️ Partition Table Editor
-
-> Visual editor for ESP8266 flash partition tables.  
+> ### 🗂️ Partition Table Editor
+> 
+>  Visual editor for ESP8266 flash partition tables.  
 > Drag-and-drop reordering, flash map visualization, presets, validation and CSV support.
-
-- Drag-and-drop partition reordering
-- Flash map visualization
-- **OTA preset** — auto-selects 1MB or 2MB+ layout based on flash size
-- **SPIFFS preset** — classic layout: nvs + phy_init + factory (512KB) + spiffs (rest)
-- **Default preset** — standard single factory app (960KB max due to ESP8266 1MB boundary)
-- Auto Offsets — automatic offset calculation
-- Validation with ESP8266-specific checks (1MB app boundary, alignment, overlaps)
-- CSV save/open
+> 
+> - Drag-and-drop partition reordering
+> - Flash map visualization
+> - **OTA preset** — auto-selects 1MB or 2MB+ layout based on flash size
+> - **SPIFFS preset** — classic layout: nvs + phy_init + factory (512KB) + spiffs (rest)
+> - **Default preset** — standard single factory app (960KB max due to ESP8266 1MB boundary)
+> - Auto Offsets — automatic offset calculation
+> - Validation with ESP8266-specific checks (1MB app boundary, alignment, overlaps)
+> - CSV save/open
 
 ### ⚗️ Advanced (Experimental)
 - eFuse Common / Custom Table generation
