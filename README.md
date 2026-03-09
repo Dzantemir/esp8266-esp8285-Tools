@@ -82,15 +82,11 @@ Visual editor for ESP8266 flash partition tables:
 
 ### For ESP8266_RTOS_SDK (idf.py):
 - [Python 3.7.x](https://www.python.org/downloads/release/python-379/) — **must be 3.7.x**, newer versions are not compatible with ESP8266 SDK
-  > ⚠️ During installation check **"Add Python to PATH"**
 - [ESP8266_RTOS_SDK](https://github.com/espressif/ESP8266_RTOS_SDK) — download and set path via extension settings
 
 ### For ESP8266_NonOS_SDK (make):
 - [ESP8266_NonOS_SDK](https://github.com/espressif/ESP8266_NONOS_SDK) — set path via extension settings
 - `make` toolchain in PATH
-
-### For SPIFFS:
-- [mkspiffs](https://github.com/igrr/mkspiffs) in PATH
 
 ---
 
@@ -98,7 +94,6 @@ Visual editor for ESP8266 flash partition tables:
 
 1. Install the extension — sidebar shows the full command tree immediately
 2. **Install Python 3.7** — click ⚠️ Python 3.7 not found in sidebar → Download Python 3.7
-   > ⚠️ During Python installation, check **"Add Python to PATH"**
 3. **Set up SDK** — in sidebar, click **RTOS IDF: not set** or **NonOS SDK: not set** and point to your SDK folder
 4. **Install build tools** — extension detects missing tools and offers to install automatically
 5. Select your COM port via **Serial Source Settings → Port**
