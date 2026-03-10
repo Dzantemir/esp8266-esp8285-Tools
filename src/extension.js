@@ -33,6 +33,7 @@ let _globalBusyName   = '';        // name of running command (for messages)
 let provider          = null;      // EspProvider instance (set in activate)
 let _partitionPanels  = new Set(); // open Partition Editor panels
 let _partitionPanel   = null;      // singleton — only one editor at a time
+let _pushSdkconfigUpdate = null;   // callback — auto-refresh partition editor after menuconfig
 
 // ─── Platform ─────────────────────────────────────────────────────────────────
 const IS_WIN   = os.platform() === 'win32';
@@ -184,7 +185,7 @@ async function getPythonCmd(force = false, silent = false) {
 
     // Helper: cache and return found pythonCmd
     const found = async (cmd, label) => {
-        // cp.exec использует cmd без &, терминал PowerShell требует & перед quoted path
+        // cp.exec uses cmd.exe (no &), terminal needs & prefix for quoted paths in PowerShell
         const termCmd = (IS_WIN && cmd.startsWith('"')) ? `& ${cmd}` : cmd;
         _pythonCmd     = termCmd;
         _pythonCmdTime = Date.now();
@@ -322,11 +323,23 @@ async function requireReady() {
     if (!pythonCmd) return false; // getPythonCmd already showed the error
     const root = getActiveRoot();
     if (!root) {
-        vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder')
-            .then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+        warnNoProject();
         return false;
     }
     return true;
+}
+
+// ─── Shared one-liner helpers ────────────────────────────────────────────────
+function warnNoProject() {
+    vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder')
+        .then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+}
+
+// Returns pip install command parts for requirements.txt (IS_WIN aware)
+function pipInstallReqsParts(idfPath, pythonCmd, reqTxt) {
+    return IS_WIN
+        ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install --user -r ${q(reqTxt)}`]
+        : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install --user -r ${q(reqTxt)}`];
 }
 
 async function runMake(target, termName, isBuildCommand = false) {
@@ -338,7 +351,7 @@ async function runMake(target, termName, isBuildCommand = false) {
     if (!pythonCmd) return; // getPythonCmd already showed the error
 
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
+    if (!root) { warnNoProject(); return; }
 
     // Verify this is a valid NonOS project
     if (!fs.existsSync(path.join(root, 'Makefile'))) {
@@ -351,6 +364,9 @@ async function runMake(target, termName, isBuildCommand = false) {
         vscode.window.showErrorMessage('ESP: NONOS SDK path not set or invalid! Check extension settings.');
         return;
     }
+
+    const rtosPathForDeps = getValidIdfPath();
+    if (!await checkPythonDeps(rtosPathForDeps, pythonCmd)) return;
 
     log(`NONOS: running make ${target}`);
 
@@ -382,8 +398,11 @@ async function runNonosFlash(eraseFirst = false) {
     const pythonCmd = await getPythonCmd();
     if (!pythonCmd) return; // getPythonCmd already showed the error
 
+    const rtosPathNonos = getValidIdfPath();
+    if (!await checkPythonDeps(rtosPathNonos, pythonCmd)) return;
+
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
+    if (!root) { warnNoProject(); return; }
 
     let port = cfg('comPort');
     if (!port) { port = await cmdSelectPort(); if (!port) return; }
@@ -463,6 +482,9 @@ async function runNonosMonitor() {
     const pythonCmd = await getPythonCmd();
     if (!pythonCmd) return; // getPythonCmd already showed the error
 
+    const rtosPathMon = getValidIdfPath();
+    if (!await checkPythonDeps(rtosPathMon, pythonCmd)) return;
+
     let port = cfg('comPort');
     if (!port) { port = await cmdSelectPort(); if (!port) return; }
 
@@ -502,8 +524,6 @@ async function runNonosMonitor() {
     log(`NONOS monitor: ${port} @ ${baud}`);
 }
 
-// ─── Run idf.py (unified sendText on all platforms) ──────────────────────────
-
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  RTOS SDK: idf.py runner                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
@@ -524,10 +544,11 @@ async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {})
 
     const toolsOk = await checkToolsOrPrompt(idfPath, pythonCmd);
     if (!toolsOk) return;
+    if (!await checkPythonDeps(idfPath, pythonCmd)) return;
     // ─────────────────────────────────────────────────────────────────────────
 
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
+    if (!root) { warnNoProject(); return; }
 
     // Save all unsaved files before build commands
     if (isBuildCommand) {
@@ -659,13 +680,10 @@ async function runFlash(action = 'flash') {
     }
     const toolsOkFlash = await checkToolsOrPrompt(idfPathFlash, pythonCmdFlash);
     if (!toolsOkFlash) return;
-    // ─────────────────────────────────────────────────────────────────────────
-
     // ── Project folder check BEFORE port ─────────────────────────────────────
     const rootFlash = getActiveRoot();
     if (!rootFlash) {
-        vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder')
-            .then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+        warnNoProject();
         return;
     }
     // ─────────────────────────────────────────────────────────────────────────
@@ -781,12 +799,6 @@ function cmdStopMonitor() {
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  HOTPLUG: Port Detection                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
-// ─── Check SDK installation ───────────────────────────────────────────────────
-// Returns idfPath if valid, null if not found
-function checkSdkInstalled() {
-    return getValidIdfPath();
-}
-
 // ─── Full environment check: python → sdk → tools ──────────────────────
 // Shows warnings in tree AND one-time popup dialog
 // silent=true: only update tree warnings, no popups
@@ -926,42 +938,8 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
             async (err, stdout, stderr) => {
                 const toolsMissing = err || (stderr && stderr.includes('ERROR:'));
                 if (!toolsMissing) {
-                    // ── Also check requirements.txt are satisfied ─────────────
-                    const reqTxt = path.join(idfPath, 'requirements.txt');
-                    if (fs.existsSync(reqTxt)) {
-                        cp.exec(
-                            `${toExecCmd(pythonCmd)} -m pip check`,
-                            async (reqErr, reqOut, reqStderr) => {
-                                const combined = (reqOut || '') + (reqStderr || '');
-                                const reqMissing = reqErr || combined.toLowerCase().includes('is not installed') || combined.toLowerCase().includes('has requirement');
-                                if (reqMissing) {
-                                    const ans = await vscode.window.showWarningMessage(
-                                        'ESP-IDF: Python requirements from requirements.txt are not satisfied. Install now?',
-                                        'Install', 'Skip'
-                                    );
-                                    if (ans === 'Install') {
-                                        const t = getTerm('ESP › Install Tools');
-                                        t.show(true);
-                                        setBusy('Installing requirements');
-                                        const markerFile = path.join(os.tmpdir(), `esp_req_${Date.now()}.tmp`);
-                                        const parts = IS_WIN
-                                            ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install -r ${q(reqTxt)}`]
-                                            : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install -r ${q(reqTxt)}`];
-                                        t.sendText(buildCmd(parts) + buildMarkerCmd(markerFile));
-                                        watchCommandDone(markerFile, 'ESP › Install Tools').then(() => {
-                                            clearBusy();
-                                            vscode.window.showInformationMessage('✅ Python requirements installed!');
-                                        });
-                                    }
-                                }
-                                _toolsVerified = true;
-                                resolve(true);
-                            }
-                        );
-                    } else {
-                        _toolsVerified = true; // ✅ cache result — skip subprocess on next command
-                        resolve(true);
-                    }
+                    _toolsVerified = true;
+                    resolve(true);
                     return;
                 }
 
@@ -1009,16 +987,10 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
                     if (!pipOk) { clearBusy(); resolve(false); return; }
 
                     const parts = IS_WIN
-                        ? [
-                            `$env:IDF_PATH=${q(idfPath)}`,
-                            `${pythonCmd} ${q(idfToolsPy)} install`,
-                            ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
-                          ]
-                        : [
-                            `export IDF_PATH=${q(idfPath)}`,
-                            `${pythonCmd} ${q(idfToolsPy)} install`,
-                            ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
-                            ];
+                        ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
+                           ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])]
+                        : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
+                           ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])];
                     t.sendText(buildCmd(parts) + buildMarkerCmd(markerFile));
 
                     watchCommandDone(markerFile, 'ESP › Install Tools').then(() => {
@@ -1033,7 +1005,6 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
     });
 }
 
-// ─── Patch tools.json — add mkspiffs if missing ───────────────────────────────
 // ─── Find mkspiffs binary in ~/.espressif/tools/mkspiffs/ ────────────────────
 function getMkspiffsCmd() {
     const espressifBase = path.join(os.homedir(), '.espressif', 'tools', 'mkspiffs');
@@ -1121,7 +1092,43 @@ function patchToolsJson(idfPath) {
     }
 }
 
-async function checkAndInstallTools() {
+// ─── Check python deps before each command ───────────────────────────────────
+// Returns true if OK, false if user skipped (command should abort)
+async function checkPythonDeps(idfPath, pythonCmd) {
+    if (!idfPath || !pythonCmd) return true; // can't check — allow command
+    const checkDepsPy = path.join(idfPath, 'tools', 'check_python_dependencies.py');
+    if (!fs.existsSync(checkDepsPy)) return true; // no script — allow command
+    const pyExec = pythonCmd.replace(/^& /, '').replace(/'/g, '');
+    return new Promise(resolve => {
+        cp.exec(
+            `"${pyExec}" "${checkDepsPy}"`,
+            { env: { ...process.env, IDF_PATH: idfPath } },
+            async (depErr) => {
+                if (!depErr) { resolve(true); return; }
+                const ans = await vscode.window.showWarningMessage(
+                    'ESP-IDF: Python requirements not satisfied. Install now?',
+                    'Install', 'Skip'
+                );
+                if (ans === 'Install') {
+                    const reqTxt = path.join(idfPath, 'requirements.txt');
+                    const t2 = getTerm('ESP › Install Requirements');
+                    t2.show(true);
+                    setBusy('Installing requirements');
+                    const markerFile = path.join(os.tmpdir(), `esp_req_${Date.now()}.tmp`);
+                    const parts = pipInstallReqsParts(idfPath, pythonCmd, reqTxt);
+                    t2.sendText(buildCmd(parts) + buildMarkerCmd(markerFile));
+                    watchCommandDone(markerFile, 'ESP › Install Requirements').then(() => {
+                        clearBusy();
+                        vscode.window.showInformationMessage('✅ Python requirements installed!');
+                    });
+                }
+                resolve(false); // abort command — let user install first
+            }
+        );
+    });
+}
+
+async function checkAndInstallTools(silent = true) {
     // Use getValidIdfPath() so env var IDF_PATH is also considered
     const idfPath = getValidIdfPath();
     if (!idfPath) return;
@@ -1129,7 +1136,7 @@ async function checkAndInstallTools() {
     const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
     if (!fs.existsSync(idfToolsPy)) return;
 
-    const pythonCmd = await getPythonCmd(false, true); // silent — startup background check
+    const pythonCmd = await getPythonCmd(false, silent); // silent on startup, loud on Refresh
     if (!pythonCmd) return;
 
     return new Promise(resolve => {
@@ -1165,16 +1172,10 @@ async function checkAndInstallTools() {
 
                         const reqTxt = path.join(idfPath, 'requirements.txt');
                         const parts = IS_WIN
-                            ?[
-                                `$env:IDF_PATH=${q(idfPath)}`,
-                                `${pythonCmd} ${q(idfToolsPy)} install`,
-                                ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
-                                ]
-                            :[
-                                `export IDF_PATH=${q(idfPath)}`,
-                                `${pythonCmd} ${q(idfToolsPy)} install`,
-                                ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : []),
-                            ];
+                            ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
+                               ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])]
+                            : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
+                               ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])];
                         t.sendText(buildCmd(parts) + marker);
 
                         // Watch for completion and unlock
@@ -1183,6 +1184,43 @@ async function checkAndInstallTools() {
                             vscode.window.showInformationMessage('✅ ESP-IDF tools installed successfully!');
                         });
                     }
+                } else {
+                    // ── Tools OK — check Python requirements ─────────────────
+                    // Use SDK's own check_python_dependencies.py with IDF_PATH set
+                    const checkDepsPy = path.join(idfPath, 'tools', 'check_python_dependencies.py');
+                    const reqTxt2     = path.join(idfPath, 'requirements.txt');
+                    if (fs.existsSync(checkDepsPy)) {
+                        // check_python_dependencies.py: double quotes required (cmd.exe)
+                        const pyExec  = pythonCmd.replace(/^& /, '').replace(/'/g, '');
+                        cp.exec(
+                            `"${pyExec}" "${checkDepsPy}"`,
+                            { env: { ...process.env, IDF_PATH: idfPath } },
+                            async (depErr) => {
+                                if (depErr) {
+                                    const ans = await vscode.window.showWarningMessage(
+                                        'ESP-IDF: Python requirements not satisfied. Install now?',
+                                        'Install', 'Skip'
+                                    );
+                                    if (ans === 'Install') {
+                                        const t2 = getTerm('ESP › Install Requirements');
+                                        t2.show(true);
+                                        setBusy('Installing requirements');
+                                        const markerFile2 = path.join(os.tmpdir(), `esp_req_${Date.now()}.tmp`);
+                                        const parts2 = pipInstallReqsParts(idfPath, pythonCmd, reqTxt2);
+                                        t2.sendText(buildCmd(parts2) + buildMarkerCmd(markerFile2));
+                                        watchCommandDone(markerFile2, 'ESP › Install Requirements').then(() => {
+                                            clearBusy();
+                                            vscode.window.showInformationMessage('✅ Python requirements installed!');
+                                        });
+                                    }
+                                }
+                                resolve();
+                            }
+                        );
+                    } else {
+                        resolve();
+                    }
+                    return;
                 }
                 resolve();
             }
@@ -1386,8 +1424,6 @@ function buildCmd(parts) {
     return IS_WIN ? parts.join('; ') : parts.join(' && ');
 }
 
-// ─── IDF env prefix ───────────────────────────────────────────────────────────
-// ─── Collect all bin/ paths from ~/.espressif/tools/ ─────────────────────────
 // ─── Create version.txt if missing or content invalid ────────────────────────
 // idf_tools.py parses it with: re.search(r'v([0-9]+\.[0-9]+).*', content)
 // So valid content must start with e.g. "v5.1" or "v3.2.1"
@@ -1415,6 +1451,7 @@ function ensureVersionTxt(idfPath) {
     }
 }
 
+// ─── IDF env prefix ───────────────────────────────────────────────────────────
 function buildIdfEnvPrefix(idfPath, pythonCmd) {
     const py = pythonCmd || (IS_WIN ? 'python' : 'python3');
     if (IS_WIN) {
@@ -1462,6 +1499,10 @@ function watchCommandDone(markerFile, termName) {
                 clearInterval(timer);
                 try { fs.unlinkSync(markerFile); } catch {}
                 resolve(); clearBusy();
+                // Auto-refresh partition editor if menuconfig just finished
+                if (_pushSdkconfigUpdate && termName === 'ESP › Menuconfig') {
+                    setTimeout(() => { try { _pushSdkconfigUpdate(); } catch {} }, 300);
+                }
             }
         }, 400);
     });
@@ -1948,6 +1989,7 @@ function activate(ctx) {
             if (e.affectsConfiguration('esp-idf-tools.idfPath')) {
                 if (cfg('idfPath') === _idfPathOverride) _idfPathOverride = null;
                 _pythonCmd = null; _toolsVerified = false;
+
                 checkAndInstallTools();
                 setTimeout(() => autoGenerateDevFiles(), 1000);
             }
@@ -2039,7 +2081,8 @@ function activate(ctx) {
         const idfPath  = getValidIdfPath();
         if (idfPath) ensureVersionTxt(idfPath);
         provider.refresh();
-        checkEnvironment(true).then(ok => { if (ok) checkAndInstallTools(); });
+        checkEnvironment(true);
+        checkAndInstallTools(false);
     });
     reg('esp.fixPython',               () => cmdFixPython());
     reg('esp.fixSdk',                  () => cmdFixSdk());
@@ -2202,7 +2245,7 @@ async function checkRequirements({ needsRoot = true } = {}) {
     const pythonCmd = await getPythonCmd();
     if (!pythonCmd) return false; // getPythonCmd already showed the error
     if (needsRoot && !getActiveRoot()) {
-        vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); });
+        warnNoProject();
         return false;
     }
     return true;
@@ -2381,7 +2424,10 @@ async function cmdDeleteComponent(item) {
 
 async function cmdAddComponent() {
     const root = getActiveRoot();
-    if (!await requireReady()) return;
+    if (!root) {
+        warnNoProject();
+        return;
+    }
 
     // NonOS SDK uses make, not cmake — components not supported yet
     if (getActiveSdkType() === 'nonos') {
@@ -2498,7 +2544,10 @@ async function cmdAddComponent() {
 // ─── Edit existing component ──────────────────────────────────────────────────
 async function cmdEditComponent(item) {
     const root = getActiveRoot();
-    if (!await requireReady()) return;
+    if (!root) {
+        warnNoProject();
+        return;
+    }
 
     const compName = item?._compName || item?.label;
     if (!compName) { vscode.window.showErrorMessage('ESP: Cannot determine component name.'); return; }
@@ -3286,7 +3335,7 @@ async function cmdResetConfig() {
 // ╚══════════════════════════════════════════════════════════════════╝
 function cmdPartitionEditor() {
     const root = getActiveRoot();
-    if (!root) { vscode.window.showErrorMessage('ESP: Select project folder!', 'Select Folder').then(a => { if (a === 'Select Folder') vscode.commands.executeCommand('esp.selectProject'); }); return; }
+    if (!root) { warnNoProject(); return; }
 
     // Singleton — reveal existing panel instead of opening a duplicate
     if (_partitionPanel) {
@@ -3366,13 +3415,14 @@ function cmdPartitionEditor() {
     }
     _partitionPanel = panel;
     _partitionPanels.add(panel);
+    _pushSdkconfigUpdate = pushSdkconfigUpdate; // expose for auto-refresh after menuconfig
     panel.onDidChangeViewState(e => {
         if (e.webviewPanel.visible) pushSdkconfigUpdate();
         if (e.webviewPanel.visible && _globalBusy) {
             panel.webview.postMessage({ command: 'setBusy', busy: true, task: _globalBusyName });
         }
     });
-    panel.onDidDispose(() => { _partitionPanels.delete(panel); _partitionPanel = null; }, null, []);
+    panel.onDidDispose(() => { _partitionPanels.delete(panel); _partitionPanel = null; _pushSdkconfigUpdate = null; }, null, []);
 }
 
 function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSizeVal) {
@@ -3519,7 +3569,7 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
     <h2>⚡ ESP Partition Table Editor</h2>
     <p class="subtitle">Visual editor for ESP8266 flash partitions → saves to <code title="Filename from menuconfig → Partition Table → Custom partition CSV file (CONFIG_PARTITION_TABLE_CUSTOM_FILENAME)">${safeFilename}</code></p>
   </div>
-  <button class="refresh-btn" onclick="refreshFromMenuconfig()" title="Re-read PT offset and Flash size from sdkconfig">↺ Refresh From Menuconfig</button>
+  <!-- Refresh From Menuconfig: now automatic after menuconfig finishes -->
 </div>
 
 <div class="flash-map-wrap">

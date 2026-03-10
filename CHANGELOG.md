@@ -1,6 +1,76 @@
 # Changelog
 
-## [0.9.7]
+## [0.9.34]
+- Code optimization: extracted warnNoProject() helper (was duplicated 5×) and pipInstallReqsParts() helper (was duplicated 4×); compacted install parts arrays
+
+- Code cleanup: removed dead checkSdkInstalled(), duplicate comments, stale depsPy alias, unused params, simplified else-if chain, fixed misplaced section headers
+
+- Partition Editor: removed "Refresh From Menuconfig" button — now auto-refreshes PT offset and Flash size automatically when menuconfig finishes
+
+- checkPythonDeps: already present in all commands (runIdf, runMake, runNonosFlash, runNonosMonitor). Removed duplicate call in runFlash (was calling runIdf which already checks)
+
+- Refresh: fixed — checkAndInstallTools(false) now always called, not blocked by checkEnvironment returning false when Python missing
+
+- Refresh: fixed double popup — checkEnvironment stays silent, checkAndInstallTools(false) shows Python error with Set/Download buttons
+
+- Refresh button: changed checkEnvironment(true→false) — now shows popup if Python not found or other issues
+
+- pip install: added --user flag to all 6 occurrences — matches SDK recommendation
+
+- Requirements check: fixed quoting for cmd.exe — cp.exec uses cmd.exe on Windows which requires double quotes, not single quotes from q()
+
+- Requirements check: removed unnecessary PYTHON env var — check_python_dependencies.py does not use it
+
+- Requirements check: simplified — call check_python_dependencies.py exactly as idf.py does (IDF_PATH + PYTHON in env, no extra args)
+
+- Requirements check: fixed root cause — check_python_dependencies.py does not filter blank lines/comments, pkg_resources.require("") always throws. Now writes filtered temp file and passes via --requirements
+
+- Requirements check: fixed env — now passes both IDF_PATH and PYTHON vars, exactly as idf.py does
+
+- Requirements check: reverted to check_python_dependencies.py with IDF_PATH properly set in env — check only, no installation
+
+- Requirements check: replaced check_python_dependencies.py (uses pkg_resources which misses site-packages) with `pip install -r requirements.txt --quiet` — reliable on all Python configs
+
+- Requirements check: runs check_python_dependencies.py at startup and on Refresh with IDF_PATH set — same as idf.py. Shows Install dialog only if failed
+
+- Removed automatic requirements check — was causing false positives on all configurations. idf.py reports missing packages in terminal with exact install command
+
+- Requirements check: fixed — removed _toolsVerified=false after install (was causing dialog to reappear on every Build after install)
+
+- Requirements check: stopped using check_python_dependencies.py (does not filter comment/blank lines → always fails). Own script with proper filtering: skips comments, ignores VersionConflict, only DistributionNotFound triggers dialog
+
+- Requirements check: pass --requirements flag to check_python_dependencies.py — no longer needs IDF_PATH env var
+
+- Requirements check: now uses SDK's own check_python_dependencies.py — 100% matches what idf.py checks. Offers Install on failure, blocks build until fixed
+
+- Removed automatic requirements.txt check — idf.py already checks and reports missing packages with exact install command
+
+- Requirements check: result cached in globalState — check runs once, remembered across VSCode restarts. Cache resets when IDF path changes
+
+- Requirements check: fixed false positives — proper indented script, catches ALL exceptions per-package (VersionConflict, InvalidVersion etc.), outer try/except so any pkg_resources error defaults to OK
+
+- Requirements check: fixed VersionConflict false positive (e.g. cryptography>=35 installed but requirements.txt says <35) — now only DistributionNotFound triggers dialog
+
+- Requirements check: fixed — now writes temp .py script with proper filtering (blank lines, comments stripped before pkg_resources.require)
+- Check runs at startup (silent if OK) and on first Build — no false positives
+
+- Reverted: removed automatic requirements.txt check — was causing false positives
+
+- Requirements check: replaced `idf_tools.py check-python-dependencies` with `pkg_resources.require()` — works correctly in Python 3.7, no false positives
+- Requirements check runs at startup (after tools verified) AND on first Build — shows dialog only when actually missing
+
+- Requirements check: moved back to Build/Flash only — dialog appears on first Build press, not at startup
+
+- Requirements check moved to startup (checkAndInstallTools) — dialog appears once at startup, not on every Build
+- Build: _toolsVerified already true by the time Build runs — no repeated dialogs
+
+- Build: fixed cyclic requirements warning — _toolsVerified now set immediately on any answer (Install or Skip), dialog shows only once per session
+
+- Build: fixed requirements check — now uses `idf_tools.py check-python-dependencies` (same as idf.py itself) instead of `pip check`
+- Build: if requirements not satisfied — blocks build and offers Install button
+
+- Add Component / Edit Component: removed Python check — these are file operations, only project folder is required
+
 - Build: fixed requirements check — replaced `pip install --dry-run` (not supported in pip<21) with `pip check` (works with Python 3.7)
 
 - Build: added requirements.txt check before build — if Python packages not satisfied, offers to install automatically (was silently failing at idf.py build step)

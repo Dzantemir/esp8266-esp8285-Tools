@@ -2,7 +2,7 @@
   "name": "esp-idf-tools",
   "displayName": "ESP8266 / ESP8285 Tools",
   "description": "Build, flash, monitor and configure ESP8266/ESP8285 projects. Supports ESP8266_RTOS_SDK (idf.py) and ESP8266_NonOS_SDK.",
-  "version": "0.9.7",
+  "version": "0.9.34",
   "publisher": "Dzantemir",
   "engines": {
     "vscode": "^1.75.0"
