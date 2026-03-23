@@ -24,8 +24,14 @@ let _toolsVerified    = false; // true once idf_tools.py check passed — reset 
 const PYTHON_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 let _statusBarPort    = null;      // StatusBarItem — port
 let _statusBarBusy    = null;      // StatusBarItem — busy indicator
+let _statusBarBuild   = null;      // StatusBarItem — build button
+let _statusBarFlash   = null;      // StatusBarItem — flash button
+let _statusBarMonitor = null;      // StatusBarItem — monitor toggle button
+let _statusBarClean   = null;      // StatusBarItem — clean button
+let _monitorRunning   = false;     // true while monitor terminal is active
 let _globalBusy       = false;     // true while ANY command is running
 let _globalBusyName   = '';        // name of running command (for messages)
+let _provider         = null;      // TreeDataProvider — for sidebar refresh
 let provider          = null;      // EspProvider instance (set in activate)
 let _partitionPanels  = new Set(); // open Partition Editor panels
 let _partitionPanel   = null;      // singleton — only one editor at a time
@@ -81,8 +87,7 @@ function getValidIdfPath() {
     return p;
 }
 
-// ─── NONOS SDK detection ──────────────────────────────────────────────────────
-// Returns 'rtos', 'nonos', or null
+// ─── Shell detection ────────────────────────────────────────────────────────────
 function getUserShell() {
     if (IS_WIN) return cfg('shellPath') || 'powershell.exe';
     return cfg('shellPath') || process.env.SHELL || '/bin/bash';
@@ -318,12 +323,16 @@ function warnNoProject() {
 // Returns pip install command parts for requirements.txt (IS_WIN aware)
 function pipInstallReqsParts(idfPath, pythonCmd, reqTxt) {
     return IS_WIN
-        ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install --user -r ${q(reqTxt)}`]
-        : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install --user -r ${q(reqTxt)}`];
+        ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install -r ${q(reqTxt)}`]
+        : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} -m pip install -r ${q(reqTxt)}`];
 }
 
 // ─── Tools platform key (OS + arch) ──────────────────────────────────────────
-
+function getToolsPlatform() {
+    if (IS_WIN)  return os.arch() === 'x64' ? 'win64'       : 'win32';
+    if (IS_MAC)  return os.arch() === 'arm64' ? 'macos-arm64' : 'macos';
+    return os.arch() === 'x64' ? 'linux-amd64' : 'linux-i686';
+}
 
 // Returns manual tools path (override or config)
 // Returns true if manual tools mode is active and toolsPath is set
@@ -486,6 +495,9 @@ async function runFlash(action = 'flash', eraseFirst = false) {
         warnNoProject();
         return;
     }
+
+    // ── Save all unsaved files before flash ──────────────────────────────────
+    await vscode.workspace.saveAll(false);
     // ─────────────────────────────────────────────────────────────────────────
 
     const overrideFlash = cfg('overrideFlashConfig');
@@ -563,6 +575,11 @@ async function runFlash(action = 'flash', eraseFirst = false) {
         }
     }
 
+    if (isMonitor || baseAction === 'monitor') {
+        _monitorRunning = true;
+        refreshMonitorButton();
+    }
+
     await runIdf(args, title, false, extraEnvVars);
 }
 
@@ -592,6 +609,8 @@ function cmdStopMonitor() {
     if (!found) {
         vscode.window.showWarningMessage('ESP: No active monitor terminal found.');
     }
+    _monitorRunning = false;
+    refreshMonitorButton();
 }
 
 
@@ -681,16 +700,7 @@ async function cmdFixPython() {
     vscode.env.openExternal(vscode.Uri.parse('https://www.python.org/downloads/release/python-379/'));
 }
 
-async function cmdFixSdk(forceType = null) {
-    let isRtos;
-
-    if (forceType !== null) {
-        // Called directly from sidebar — type already known
-        isRtos = forceType;
-    } else {
-        isRtos = true;
-    }
-
+async function cmdFixSdk() {
     const cfgKey  = 'idfPath';
     const sdkName = 'RTOS SDK';
     const envVar  = 'IDF_PATH';
@@ -709,8 +719,7 @@ async function cmdFixSdk(forceType = null) {
             tooltip:  `Show expected ${sdkName} folder structure`
         }];
         qp.onDidTriggerButton(async () => {
-            const msg = isRtos
-                ? [
+            const msg = [
                     `📁 ESP8266_RTOS_SDK\\`,
                     `├── components\\    ← required`,
                     `├── tools\\         ← required`,
@@ -720,20 +729,6 @@ async function cmdFixSdk(forceType = null) {
                     ``,
                     `Download:`,
                     `  github.com/espressif/ESP8266_RTOS_SDK`,
-                  ].join('\n')
-                : [
-                    `📁 ESP8266_NONOS_SDK\\`,
-                    `├── include\\      ← required`,
-                    `├── lib\\          ← required`,
-                    `├── ld\\           ← required`,
-                    `├── tools\\        ← required`,
-                    `├── Makefile       ← required`,
-                    `├── bin\\`,
-                    `├── driver_lib\\`,
-                    `└── examples\\`,
-                    ``,
-                    `Download:`,
-                    `  github.com/espressif/ESP8266_NONOS_SDK`,
                   ].join('\n');
             const btn = await vscode.window.showInformationMessage(
                 `Expected ${sdkName} folder structure`,
@@ -764,17 +759,15 @@ async function cmdFixSdk(forceType = null) {
         if (!folder?.[0]) return;
         const selected = folder[0].fsPath;
 
-        // Validate
-        if (isRtos) {
-            const missing = checkRtosSdkStructure(selected);
-            if (missing.length) {
-                const ok = await vscode.window.showWarningMessage(
-                    `Required files not found — this does not look like a valid RTOS SDK. Use anyway?`,
-                    { modal: true, detail: `Missing:\n${missing.map(f => `  • ${f}`).join('\n')}` },
-                    'Yes', 'Cancel'
-                );
-                if (ok !== 'Yes') return;
-            }
+        // Validate RTOS SDK structure
+        const missing = checkRtosSdkStructure(selected);
+        if (missing.length) {
+            const ok = await vscode.window.showWarningMessage(
+                `Required files not found — this does not look like a valid RTOS SDK. Use anyway?`,
+                { modal: true, detail: `Missing:\n${missing.map(f => `  • ${f}`).join('\n')}` },
+                'Yes', 'Cancel'
+            );
+            if (ok !== 'Yes') return;
         }
         await setCfg(cfgKey, selected);
         ensureVersionTxt(selected); _pythonCmd = null; _toolsVerified = false;
@@ -812,7 +805,9 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
                 const combined = (stdout || '') + (stderr || '');
                 const match = combined.match(/ERROR:\s+The following required tools were not found:\s*(.+)/i);
                 const missingList = match ? match[1].trim() : '';
-                
+                const detail = missingList
+                    ? `Missing tools: ${missingList}`
+                    : 'Run "Install Tools" to set up the build environment.';
 
                 // Tools missing — show blocking prompt
                 const ans = await vscode.window.showErrorMessage(
@@ -850,9 +845,9 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
 
                     const parts = IS_WIN
                         ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
-                           ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])]
+                           ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : [])]
                         : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
-                           ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])];
+                           ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : [])];
                     t.sendText(buildCmd(parts) + buildMarkerCmd(markerFile));
 
                     watchCommandDone(markerFile, 'ESP › Install Tools').then(() => {
@@ -950,7 +945,7 @@ function patchToolsJson(idfPath) {
 
     try {
         fs.writeFileSync(toolsJsonPath, JSON.stringify(toolsJson, null, 2), 'utf8');
-    } catch {
+    } catch (e) {
     }
 }
 
@@ -1035,9 +1030,9 @@ async function checkAndInstallTools(silent = true) {
                         const reqTxt = path.join(idfPath, 'requirements.txt');
                         const parts = IS_WIN
                             ? [`$env:IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
-                               ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])]
+                               ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : [])]
                             : [`export IDF_PATH=${q(idfPath)}`, `${pythonCmd} ${q(idfToolsPy)} install`,
-                               ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install --user -r ${q(reqTxt)}`] : [])];
+                               ...(fs.existsSync(reqTxt) ? [`${pythonCmd} -m pip install -r ${q(reqTxt)}`] : [])];
                         t.sendText(buildCmd(parts) + marker);
 
                         // Watch for completion and unlock
@@ -1128,15 +1123,63 @@ function checkBusy() {
 
 // ─── Status Bar ───────────────────────────────────────────────────────────────
 function createStatusBar(ctx) {
-    // Busy indicator — priority 101 → appears to the LEFT of port item
-    _statusBarBusy = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
+    // Busy indicator — priority 106 → leftmost
+    _statusBarBusy = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 106);
     _statusBarBusy.command = 'workbench.action.terminal.focus';
     ctx.subscriptions.push(_statusBarBusy);
 
-    _statusBarPort = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    // Build button — priority 105
+    _statusBarBuild = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 105);
+    _statusBarBuild.text    = '$(tools) Build';
+    _statusBarBuild.tooltip = 'ESP: Build project (idf.py build)';
+    _statusBarBuild.command = 'esp.build';
+    _statusBarBuild.show();
+    ctx.subscriptions.push(_statusBarBuild);
+
+    // Flash button — priority 104
+    _statusBarFlash = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 104);
+    _statusBarFlash.text    = '$(zap) Flash';
+    _statusBarFlash.tooltip = 'ESP: Flash project (idf.py flash)';
+    _statusBarFlash.command = 'esp.flash';
+    _statusBarFlash.show();
+    ctx.subscriptions.push(_statusBarFlash);
+
+    // Clean button — priority 103
+    _statusBarClean = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 103);
+    _statusBarClean.text    = '$(trash) Clean';
+    _statusBarClean.tooltip = 'ESP: Clean build output (idf.py clean)';
+    _statusBarClean.command = 'esp.clean';
+    _statusBarClean.show();
+    ctx.subscriptions.push(_statusBarClean);
+
+    // Monitor toggle button — priority 102
+    _statusBarMonitor = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 102);
+    refreshMonitorButton();
+    ctx.subscriptions.push(_statusBarMonitor);
+
+    // Port — priority 101 → last
+    _statusBarPort = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
     _statusBarPort.command = 'esp.selectPort';
     ctx.subscriptions.push(_statusBarPort);
+
     refreshStatusBar();
+}
+
+function refreshMonitorButton() {
+    if (!_statusBarMonitor) return;
+    if (_monitorRunning) {
+        _statusBarMonitor.text            = '$(debug-stop) Monitor';
+        _statusBarMonitor.tooltip         = 'Stop Monitor';
+        _statusBarMonitor.command         = 'esp.stopMonitor';
+        _statusBarMonitor.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+    } else {
+        _statusBarMonitor.text            = '$(terminal) Monitor';
+        _statusBarMonitor.tooltip         = 'Start Monitor\nidf.py monitor';
+        _statusBarMonitor.command         = 'esp.monitor';
+        _statusBarMonitor.backgroundColor = undefined;
+    }
+    _statusBarMonitor.show();
+    if (_provider) _provider.refresh();
 }
 
 function refreshStatusBar() {
@@ -1401,7 +1444,9 @@ class EspItem extends vscode.TreeItem {
     constructor(label, opts = {}) {
         super(label, vscode.TreeItemCollapsibleState.None);
         this.command     = opts.command ? { command: opts.command, title: label } : undefined;
-        this.iconPath    = opts.icon    ? new vscode.ThemeIcon(opts.icon) : undefined;
+        this.iconPath    = opts.icon
+            ? new vscode.ThemeIcon(opts.icon, opts.iconColor ? new vscode.ThemeColor(opts.iconColor) : undefined)
+            : undefined;
         this.description = opts.desc   || '';
         this.tooltip     = opts.tooltip || label;
         if (opts.contextValue) this.contextValue = opts.contextValue;
@@ -1454,11 +1499,9 @@ class EspProvider {
             ...( (() => {
                 if (!root) return [];
                 const compDir = path.join(root, 'components');
-                if (!fs.existsSync(compDir)) return [];
-                const comps = fs.readdirSync(compDir).filter(n =>
-                    fs.statSync(path.join(compDir, n)).isDirectory()
-                );
-                if (!comps.length) return [];
+                const comps = fs.existsSync(compDir)
+                    ? fs.readdirSync(compDir).filter(n => fs.statSync(path.join(compDir, n)).isDirectory())
+                    : [];
                 const compItems = comps.map(name => {
                     const item = new EspItem(name, {
                         icon:    'package',
@@ -1468,8 +1511,10 @@ class EspProvider {
                     item._compName = name;
                     return item;
                 });
-                return [ new EspGroup('componentsGroup', '📦  Components', compItems, undefined,
-                    vscode.TreeItemCollapsibleState.Expanded) ];
+                const compGroup = new EspGroup('componentsGroup', '📦  Components', compItems, undefined,
+                    vscode.TreeItemCollapsibleState.Expanded);
+                compGroup.contextValue = 'componentsGroup';
+                return [ compGroup ];
             })() )
         ]);
         projectGroup.contextValue = 'projectFolderGroup';
@@ -1571,55 +1616,55 @@ class EspProvider {
         // ── NonOS SDK ────────────────────────────────────────────────
         // ── RTOS SDK ─────────────────────────────────────────────────
         return [
-            ...warningItems,
             createProjectItem,
             projectGroup,
 
             new EspGroup('buildGroup', '⚙️  Build', [
-                new EspItem('Build',             { command: 'esp.build',           icon: 'tools',       tooltip: 'idf.py build\nBuild the project',          contextValue: 'buildItem' }),
-                new EspItem('Build App',         { command: 'esp.buildApp',        icon: 'file-binary', tooltip: 'idf.py app\nBuild only the app',            contextValue: 'buildItem' }),
-                new EspItem('Build Bootloader',  { command: 'esp.buildBootloader', icon: 'file-binary', tooltip: 'idf.py bootloader\nBuild only bootloader',     contextValue: 'buildItem' }),
-                new EspItem('Build Part. Table', { command: 'esp.buildPartition',  icon: 'file-binary', tooltip: 'idf.py partition_table\nBuild only partition table', contextValue: 'buildItem' }),
+                new EspItem('Build',             { command: 'esp.build',           icon: 'tools',       iconColor: 'charts.green', tooltip: 'idf.py build\nBuild the project',          contextValue: 'buildItem' }),
+                new EspItem('Build App',         { command: 'esp.buildApp',        icon: 'file-binary', iconColor: 'charts.green', tooltip: 'idf.py app\nBuild only the app',            contextValue: 'buildItemSimple' }),
+                new EspItem('Build Bootloader',  { command: 'esp.buildBootloader', icon: 'file-binary', iconColor: 'charts.green', tooltip: 'idf.py bootloader\nBuild only bootloader',     contextValue: 'buildItemSimple' }),
+                new EspItem('Build Part. Table', { command: 'esp.buildPartition',  icon: 'file-binary', iconColor: 'charts.green', tooltip: 'idf.py partition_table\nBuild only partition table', contextValue: 'buildItemSimple' }),
             ]),
 
             new EspGroup('flashGroup', '⚡  Flash', [
-                new EspItem('Flash',               { command: 'esp.flash',           icon: 'zap',   tooltip: 'idf.py flash\nFlash the project',              contextValue: 'flashItem' }),
-                new EspItem('Flash App',           { command: 'esp.flashApp',        icon: 'zap',   tooltip: 'idf.py app-flash\nFlash the app only',          contextValue: 'flashAppItem' }),
-                new EspItem('Flash Bootloader',    { command: 'esp.flashBootloader', icon: 'zap',   tooltip: 'idf.py bootloader-flash\nFlash bootloader only' }),
-                new EspItem('Flash Part. Table',   { command: 'esp.flashPartition',  icon: 'zap',   tooltip: 'idf.py partition_table-flash\nFlash partition table only' }),
-                new EspItem('Erase Flash',         { command: 'esp.eraseFlash',      icon: 'trash', tooltip: 'idf.py erase_flash\nErase entire flash chip' }),
+                new EspItem('Flash',               { command: 'esp.flash',           icon: 'zap',   iconColor: 'charts.blue', tooltip: 'idf.py flash\nFlash the project',              contextValue: 'flashItem' }),
+                new EspItem('Flash App',           { command: 'esp.flashApp',        icon: 'zap',   iconColor: 'charts.blue', tooltip: 'idf.py app-flash\nFlash the app only',          contextValue: 'flashAppItem' }),
+                new EspItem('Flash Bootloader',    { command: 'esp.flashBootloader', icon: 'zap',   iconColor: 'charts.blue', tooltip: 'idf.py bootloader-flash\nFlash bootloader only',          contextValue: 'flashAppItem' }),
+                new EspItem('Flash Part. Table',   { command: 'esp.flashPartition',  icon: 'zap',   iconColor: 'charts.blue', tooltip: 'idf.py partition_table-flash\nFlash partition table only', contextValue: 'flashAppItem' }),
+                new EspItem('Erase Flash',         { command: 'esp.eraseFlash',      icon: 'trash', iconColor: 'charts.blue', tooltip: 'idf.py erase_flash\nErase entire flash chip' }),
             ]),
 
             new EspGroup('monitorGroup', '🖥️  Monitor', [
-                new EspItem('Monitor',      { command: 'esp.monitor',     icon: 'terminal',   tooltip: 'idf.py monitor\nDisplay serial output' }),
-                new EspItem('Stop Monitor', { command: 'esp.stopMonitor', icon: 'debug-stop', tooltip: 'Stop serial monitor' }),
+                new EspItem('Monitor', _monitorRunning
+                    ? { command: 'esp.stopMonitor', icon: 'debug-stop', iconColor: 'charts.purple', tooltip: 'Stop Monitor' }
+                    : { command: 'esp.monitor',     icon: 'terminal',   iconColor: 'charts.purple', tooltip: 'Start Monitor\nidf.py monitor' }),
             ]),
 
             new EspGroup('cleanGroup', '🗑️  Clean', [
-                new EspItem('Clean',      { command: 'esp.clean',     icon: 'trash',     tooltip: 'idf.py clean\nDelete build output files from the build directory' }),
-                new EspItem('Full Clean', { command: 'esp.fullclean', icon: 'clear-all', tooltip: 'idf.py fullclean\nDelete the entire build directory contents' }),
+                new EspItem('Clean',      { command: 'esp.clean',     icon: 'trash',     iconColor: 'charts.red', tooltip: 'idf.py clean\nDelete build output files from the build directory' }),
+                new EspItem('Full Clean', { command: 'esp.fullclean', icon: 'clear-all', iconColor: 'charts.red', tooltip: 'idf.py fullclean\nDelete the entire build directory contents' }),
             ]),
 
             new EspGroup('analysisGroup', '📊  Analysis', [
-                new EspItem('Size',            { command: 'esp.size',           icon: 'graph', tooltip: 'idf.py size\nPrint basic size information about the app' }),
-                new EspItem('Size Components', { command: 'esp.sizeComponents', icon: 'graph', tooltip: 'idf.py size-components\nPrint per-component size information' }),
-                new EspItem('Size Files',      { command: 'esp.sizeFiles',      icon: 'graph', tooltip: 'idf.py size-files\nPrint per-source-file size information' }),
+                new EspItem('Size',            { command: 'esp.size',           icon: 'graph', iconColor: 'charts.yellow', tooltip: 'idf.py size\nPrint basic size information about the app' }),
+                new EspItem('Size Components', { command: 'esp.sizeComponents', icon: 'graph', iconColor: 'charts.yellow', tooltip: 'idf.py size-components\nPrint per-component size information' }),
+                new EspItem('Size Files',      { command: 'esp.sizeFiles',      icon: 'graph', iconColor: 'charts.yellow', tooltip: 'idf.py size-files\nPrint per-source-file size information' }),
             ]),
 
             new EspGroup('settingsGroup', '⚙️  Serial Source Settings', [sourceItem]),
 
             new EspGroup('configureGroup', '🔩  SDK Configure', [
-                new EspItem('Menuconfig',      { command: 'esp.menuconfig',  icon: 'settings-gear', tooltip: 'idf.py menuconfig\nRun "menuconfig" project configuration tool\n⚠️ Requires terminal: min 80 columns × 19 rows' }),
-                new EspItem('Reconfigure',     { command: 'esp.reconfigure', icon: 'refresh',       tooltip: 'idf.py reconfigure\nRe-run CMake' }),
-                new EspItem('Reset Projectconfig', { command: 'esp.resetConfig', icon: 'discard',       tooltip: 'Delete sdkconfig — reset to defaults on next build' }),
+                new EspItem('Menuconfig',      { command: 'esp.menuconfig',  icon: 'settings-gear', iconColor: 'charts.orange', tooltip: 'idf.py menuconfig\nRun "menuconfig" project configuration tool\n⚠️ Requires terminal: min 80 columns × 19 rows' }),
+                new EspItem('Reconfigure',     { command: 'esp.reconfigure', icon: 'refresh',       iconColor: 'charts.orange', tooltip: 'idf.py reconfigure\nRe-run CMake' }),
+                new EspItem('Reset Projectconfig', { command: 'esp.resetConfig', icon: 'discard',       iconColor: 'charts.orange', tooltip: 'Delete sdkconfig — reset to defaults on next build' }),
             ]),
 
             pathSettingsGroup(),
             manualToolpathGroup,
 
             new EspGroup('utilsGroup', '🛠️  Utilities', [
-                new EspItem('Make SPIFFS',              { command: 'esp.spiffs',          icon: 'database', tooltip: 'mkspiffs — pack data/ folder into SPIFFS image' }),
-                new EspItem('Custom Partitions', { command: 'esp.partitionEditor', icon: 'layout',   tooltip: 'Open visual partition table editor' }),
+                new EspItem('Make SPIFFS',              { command: 'esp.spiffs',          icon: 'database', iconColor: 'charts.foreground', tooltip: 'mkspiffs — pack data/ folder into SPIFFS image' }),
+                new EspItem('Custom Partitions', { command: 'esp.partitionEditor', icon: 'layout',   iconColor: 'charts.foreground', tooltip: 'Open visual partition table editor' }),
             ]),
             vscodeUtilitiesGroup,
         ];
@@ -1634,6 +1679,7 @@ class EspProvider {
 function activate(ctx) {
     globalCtx = ctx;
     provider = new EspProvider();
+    _provider = provider;
 
     const folders   = vscode.workspace.workspaceFolders;
     const savedRoot = ctx.workspaceState.get('espActiveRoot');
@@ -1704,9 +1750,9 @@ function activate(ctx) {
     reg('esp.buildApp',        () => runIdf(['app'],             'ESP › Build App', true));
     reg('esp.buildBootloader', () => runIdf(['bootloader'],      'ESP › Build Bootloader', true));
     reg('esp.buildPartition',  () => runIdf(['partition_table'], 'ESP › Build Partition Table', true));
-    reg('esp.size',            () => runIdf(['size'],            'ESP › Size'));
-    reg('esp.sizeComponents',  () => runIdf(['size-components'], 'ESP › Size Components'));
-    reg('esp.sizeFiles',       () => runIdf(['size-files'],      'ESP › Size Files'));
+    reg('esp.size',            () => runIdf(['size'],            'ESP › Size',            true));
+    reg('esp.sizeComponents',  () => runIdf(['size-components'], 'ESP › Size Components', true));
+    reg('esp.sizeFiles',       () => runIdf(['size-files'],      'ESP › Size Files',      true));
     reg('esp.menuconfig',      () => runIdf(['menuconfig'],      'ESP › Menuconfig'));
     reg('esp.reconfigure',     () => runIdf(['reconfigure'],     'ESP › Reconfigure'));
     reg('esp.resetConfig',     async () => { await cmdResetConfig(); provider.refresh(); });
@@ -1716,7 +1762,6 @@ function activate(ctx) {
 
     reg('esp.flash',           () => runWithPostFlash('flash'));
     reg('esp.monitor',         () => runFlash('monitor'));
-    reg('esp.flashMonitor',    () => runFlash('flash_monitor'));
     reg('esp.flashApp',        () => runWithPostFlash('app-flash'));
     reg('esp.flashBootloader', () => runWithPostFlash('bootloader-flash'));
     reg('esp.flashPartition',  () => runWithPostFlash('partition_table-flash'));
@@ -1734,10 +1779,12 @@ function activate(ctx) {
     reg('esp.generateTasks',        async () => { await cmdGenerateTasks(); });
 
     reg('esp.createProject',  async () => { await cmdCreateProject();  provider.refresh(); });
+    reg('esp.editProject',    async () => { await cmdEditProject();    provider.refresh(); });
     reg('esp.selectPort',     async () => { const p = await cmdSelectPort();  provider.refresh(); refreshStatusBar(); return p; });
     reg('esp.selectIdf',      async () => { await cmdFixSdk(true);  provider.refresh(); refreshStatusBar(); });
     reg('esp.selectProject',  async () => { await cmdSelectProject();  provider.refresh(); });
-    reg('esp.configureBuild', async () => { await cmdConfigureBuild(); provider.refresh(); });
+    reg('esp.configureBuild',       async () => { await cmdConfigureBuild();       provider.refresh(); });
+    reg('esp.configureBuildSimple', async () => { await cmdConfigureBuildSimple(); provider.refresh(); });
     reg('esp.configureFlash',    async () => { await cmdConfigureFlash();    provider.refresh(); });
     reg('esp.configureFlashApp', async () => { await cmdConfigureFlashApp(); provider.refresh(); });
     reg('esp.toggleOverride', async () => { await setCfg('overrideFlashConfig', !cfg('overrideFlashConfig')); provider.refresh(); refreshStatusBar(); });
@@ -2360,21 +2407,85 @@ async function cmdEditComponent(item) {
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  PROJECT CREATION WIZARD                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
-async function cmdCreateProject() {
-    const sdkChoice = { value: 'rtos' }; // Only RTOS SDK is supported
+async function cmdEditProject() {
+    const root = getActiveRoot();
+    if (!root) { warnNoProject(); return; }
 
+    const mainCmake = path.join(root, 'main', 'CMakeLists.txt');
+    if (!fs.existsSync(mainCmake)) {
+        vscode.window.showErrorMessage('ESP: main/CMakeLists.txt not found.');
+        return;
+    }
+
+    // Parse existing CMakeLists.txt
+    const existing = fs.readFileSync(mainCmake, 'utf8');
+    const incMatch  = existing.match(/INCLUDE_DIRS\s+"([^"]+)"/);
+    const reqMatch  = existing.match(/REQUIRES\s+([^\n\)]+)/);
+    const currentInc = incMatch ? (incMatch[1] === 'include' ? 'include' : 'dot') : 'none';
+    const currentReq = reqMatch ? reqMatch[1].trim() : '';
+    const srcsMatch  = existing.match(/SRCS\s+((?:"[^"]+"\s*)+)/);
+    const currentSrcs = srcsMatch ? srcsMatch[1].match(/"([^"]+)"/g)?.map(s => s.replace(/"/g,'')) ?? [] : [];
+
+    // Step 1 — headers
+    const activeInc = currentInc === 'include' ? 'Separate include/ folder'
+                    : currentInc === 'dot'     ? 'Same folder as .c files'
+                    : 'No header files';
+    const headersChoice = await vscode.window.showQuickPick([
+        { label: '$(folder) Separate include/ folder', description: 'INCLUDE_DIRS "include"', value: 'include' },
+        { label: '$(file)   Same folder as .c files',  description: 'INCLUDE_DIRS "."',       value: 'dot'     },
+        { label: '$(x)      No header files',           description: 'no INCLUDE_DIRS',        value: 'none'    },
+    ], {
+        title: 'Edit Project — Step 1/2: Header Files',
+        placeHolder: `Current: ${activeInc}`,
+    });
+    if (!headersChoice) return;
+
+    // Step 2 — REQUIRES
+    const reqInput = await vscode.window.showInputBox({
+        title:       'Edit Project — Step 2/2: Dependencies (REQUIRES)',
+        prompt:      'Components this project depends on (comma-separated)',
+        placeHolder: 'fatfs, driver',
+        value:       currentReq,
+    });
+    if (reqInput === undefined) return;
+    const requires = reqInput.split(',').map(s => s.trim()).filter(Boolean);
+
+    // Rebuild CMakeLists.txt
+    const srcsLine = currentSrcs.map(s => `"${s}"`).join(' ') || '"main.c"';
+    const incLine  = headersChoice.value === 'include' ? '\n                       INCLUDE_DIRS "include"'
+                   : headersChoice.value === 'dot'     ? '\n                       INCLUDE_DIRS "."'
+                   : '';
+    const reqLine  = requires.length ? `\n                       REQUIRES ${requires.join(' ')}` : '';
+
+    try {
+        fs.writeFileSync(mainCmake, `idf_component_register(SRCS ${srcsLine}${incLine}${reqLine}\n)\n`);
+
+        // Create include/ if needed
+        if (headersChoice.value === 'include') {
+            fs.mkdirSync(path.join(root, 'main', 'include'), { recursive: true });
+        }
+
+        vscode.window.showInformationMessage('✅ main/CMakeLists.txt updated.');
+    } catch (e) {
+        vscode.window.showErrorMessage(`ESP: Failed to update project: ${e.message}`);
+    }
+}
+
+async function cmdCreateProject() {
+    // Step 1 — Select parent folder
     const uris = await vscode.window.showOpenDialog({
         canSelectFiles: false, canSelectFolders: true, canSelectMany: false,
-        title: 'Create New ESP8266 Project — Step 1/2: Select Parent Folder',
+        title: 'Create New ESP8266 Project — Step 1/4: Select Parent Folder',
         openLabel: 'Select Parent Folder'
     });
     if (!uris?.length) return;
     const parentDir = uris[0].fsPath;
 
+    // Step 2 — Project name
     const projectName = await vscode.window.showInputBox({
-        prompt: `New ${sdkChoice.value.toUpperCase()} project name`,
+        prompt: 'New RTOS project name',
         placeHolder: 'my_esp_project',
-        title: 'Create New ESP8266 Project — Step 2/2: Project Name',
+        title: 'Create New ESP8266 Project — Step 2/4: Project Name',
         validateInput: text => {
             if (!text?.match(/^[a-zA-Z0-9_-]+$/)) return 'Invalid name (use letters, numbers, -, _)';
             if (fs.existsSync(path.join(parentDir, text))) return 'Folder already exists';
@@ -2383,12 +2494,32 @@ async function cmdCreateProject() {
     });
     if (!projectName) return;
 
+    // Step 3 — Include folder location
+    const headersChoice = await vscode.window.showQuickPick([
+        { label: '$(folder) Separate include/ folder', description: 'INCLUDE_DIRS "include"', value: 'include' },
+        { label: '$(file)   Same folder as .c files',  description: 'INCLUDE_DIRS "."',       value: 'dot'     },
+        { label: '$(x)      No header files',           description: 'no INCLUDE_DIRS',        value: 'none'    },
+    ], {
+        title: 'Create New ESP8266 Project — Step 3/4: Header Files',
+        placeHolder: 'Where will the .h files be?',
+    });
+    if (!headersChoice) return;
+
+    // Step 4 — REQUIRES dependencies
+    const reqInput = await vscode.window.showInputBox({
+        title:       'Create New ESP8266 Project — Step 4/4: Dependencies (REQUIRES)',
+        prompt:      'Components this project depends on (comma-separated, leave empty if none)',
+        placeHolder: 'fatfs, driver',
+    });
+    if (reqInput === undefined) return;
+    const requires = reqInput.split(',').map(s => s.trim()).filter(Boolean);
+
     const projectDir = path.join(parentDir, projectName);
     try {
-        _createRtosProject(projectDir, projectName);
+        _createRtosProject(projectDir, projectName, headersChoice.value, requires);
 
         const action = await vscode.window.showInformationMessage(
-            `✅ ${sdkChoice.value.toUpperCase()} project "${projectName}" created!`,
+            `✅ RTOS project "${projectName}" created!`,
             'Open in Workspace'
         );
         if (action === 'Open in Workspace') {
@@ -2402,8 +2533,18 @@ async function cmdCreateProject() {
     }
 }
 
-function _createRtosProject(projectDir, name) {
+function _createRtosProject(projectDir, name, headersChoice = 'dot', requires = []) {
     fs.mkdirSync(path.join(projectDir, 'main'), { recursive: true });
+
+    // Create include/ folder if needed
+    if (headersChoice === 'include') {
+        fs.mkdirSync(path.join(projectDir, 'main', 'include'), { recursive: true });
+    }
+
+    const incLine = headersChoice === 'include' ? '\n                       INCLUDE_DIRS "include"'
+                  : headersChoice === 'dot'     ? '\n                       INCLUDE_DIRS "."'
+                  : '';
+    const reqLine = requires.length ? `\n                       REQUIRES ${requires.join(' ')}` : '';
 
     fs.writeFileSync(path.join(projectDir, 'CMakeLists.txt'),
 `cmake_minimum_required(VERSION 3.5)
@@ -2415,12 +2556,29 @@ project(${name})
 include $(IDF_PATH)/make/project.mk
 `);
     fs.writeFileSync(path.join(projectDir, 'main', 'CMakeLists.txt'),
-`idf_component_register(SRCS "main.c"
-                       INCLUDE_DIRS ".")
+`idf_component_register(SRCS "main.c"${incLine}${reqLine}
+)
 `);
     fs.writeFileSync(path.join(projectDir, 'main', 'component.mk'),
 `# Component makefile
 `);
+
+    // Create header stub if needed
+    if (headersChoice !== 'none') {
+        const headerDir = headersChoice === 'include'
+            ? path.join(projectDir, 'main', 'include')
+            : path.join(projectDir, 'main');
+        const guard = name.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_H';
+        fs.writeFileSync(path.join(headerDir, `${name}.h`),
+`#ifndef ${guard}
+#define ${guard}
+
+// TODO: declare ${name} API
+
+#endif // ${guard}
+`);
+    }
+
     fs.writeFileSync(path.join(projectDir, 'main', 'main.c'),
 `#include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -2525,6 +2683,40 @@ async function cmdConfigureBuild() {
     const analysisList = pickedAnalysis.length ? pickedAnalysis.map(i => i.label).join(', ') : 'none';
     vscode.window.showInformationMessage(
         `ESP: BEFORE → ${pickedPre.value} | AFTER → ${pickedPost.value} | Analysis → ${analysisList}`
+    );
+}
+
+async function cmdConfigureBuildSimple() {
+    const postAction    = cfg('postBuildAction')   || 'none';
+    const savedAnalysis = cfg('postBuildAnalysis') || [];
+
+    const analysisItems = [
+        { label: 'Size',            value: 'size',            description: 'idf.py size' },
+        { label: 'Size Components', value: 'size-components', description: 'idf.py size-components' },
+        { label: 'Size Files',      value: 'size-files',      description: 'idf.py size-files' },
+    ].map(item => ({ ...item, picked: savedAnalysis.includes(item.value) }));
+
+    const pickedAnalysis = await vscode.window.showQuickPick(analysisItems, {
+        title: 'Step 1/2: Analysis after build (space to toggle)',
+        canPickMany: true,
+        ignoreFocusOut: true,
+    });
+    if (!pickedAnalysis) return;
+
+    const postItems = [
+        { label: '$(circle-slash)  Do nothing',  value: 'none',         description: postAction === 'none'         ? '● active' : 'stop after build' },
+        { label: '$(zap)  Flash',                value: 'flash',        description: postAction === 'flash'        ? '● active' : 'idf.py build flash' },
+        { label: '$(zap)  Flash App',            value: 'app_flash',    description: postAction === 'app_flash'    ? '● active' : 'idf.py app-flash' },
+    ];
+    const pickedPost = await quickPickActive(postItems, postAction, { title: 'Step 2/2: Action AFTER build' });
+    if (!pickedPost) return;
+
+    await setCfg('postBuildAction',   pickedPost.value);
+    await setCfg('postBuildAnalysis', pickedAnalysis.map(i => i.value));
+
+    const analysisList = pickedAnalysis.length ? pickedAnalysis.map(i => i.label).join(', ') : 'none';
+    vscode.window.showInformationMessage(
+        `ESP: AFTER → ${pickedPost.value} | Analysis → ${analysisList}`
     );
 }
 
@@ -2827,7 +3019,11 @@ async function cmdMakeSpiffs() {
 
     // ── 3. Calculate folder size
     const BLOCK = 4096;
-    const MAX_SIZE = 4 * 1024 * 1024; // 4MB warning threshold
+
+    // Get flash size from settings
+    const flashSizeStr = cfg('flashSize') || '2MB';
+    const flashSizeMap = { '512KB': 524288, '1MB': 1048576, '2MB': 2097152, '4MB': 4194304, '8MB': 8388608, '16MB': 16777216 };
+    const MAX_SIZE = flashSizeMap[flashSizeStr] || 2097152;
 
     function getFolderSize(dir) {
         let total = 0;
@@ -2844,21 +3040,21 @@ async function cmdMakeSpiffs() {
     const dataSize = getFolderSize(dataDir);
     log(`[spiffs] folder: ${dataDir} | size: ${dataSize} B (${(dataSize/1024).toFixed(1)} KB)`);
 
-    // ── 4. Warn if folder exceeds 4MB
-    if (dataSize > MAX_SIZE) {
-        const ans = await vscode.window.showWarningMessage(
-            `ESP SPIFFS: Folder size is ${(dataSize / 1024 / 1024).toFixed(2)} MB which exceeds 4MB. ESP8266 flash is typically 1–4MB total. Continue anyway?`,
-            'Continue', 'Cancel'
-        );
-        if (ans !== 'Continue') return;
-    }
-
-    // ── 5. Calculate image size
+    // ── 4. Calculate image size
     // SPIFFS: dataSize * 2, rounded up to block (4096), + 1 extra block, minimum 4 blocks (16KB)
     const MIN_BLOCKS = 4;
     const blocksNeeded = dataSize > 0 ? Math.ceil((dataSize * 2) / BLOCK) + 1 : 0;
     const size = Math.max(blocksNeeded, MIN_BLOCKS) * BLOCK;
     log(`[spiffs] data: ${dataSize} B → image: ${size} B (${(size/1024).toFixed(1)} KB)`);
+
+    // ── 5. Warn if image size exceeds flash size
+    if (size > MAX_SIZE) {
+        const ans = await vscode.window.showWarningMessage(
+            `ESP SPIFFS: Image size (${(size/1024/1024).toFixed(2)} MB) exceeds total flash size (${flashSizeStr}). Reduce the number or size of files. Continue anyway?`,
+            'Continue', 'Cancel'
+        );
+        if (ans !== 'Continue') return;
+    }
 
     // ── 7. Output: project folder, filename = selected folder name + .bin
     const outBin = path.join(root, path.basename(dataDir) + '.bin');
@@ -3002,19 +3198,108 @@ function cmdPartitionEditor() {
                            '512K':'524288','1M':'1048576','2M':'2097152','4M':'4194304' };
     const ptOffsetVal  = rawPtOffset;
     const flashSizeVal = (rawFlashSize && flashSizeMap[rawFlashSize]) ? flashSizeMap[rawFlashSize] : '1048576';
-    panel.webview.html = getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSizeVal);
+    // Restore bin links from CMakeLists.txt if previously saved
+    let _restoredLinks = [];
+    const _cmakePath = path.join(root, 'CMakeLists.txt');
+    if (fs.existsSync(_cmakePath)) {
+        try {
+            const _cmakeContent = fs.readFileSync(_cmakePath, 'utf8').replace(/\r\n/g, '\n');
+            const _blockMatch = _cmakeContent.match(/# ESP8266 Tools: partition bin links -- BEGIN([\s\S]*?)# ESP8266 Tools: partition bin links -- END/);
+            if (_blockMatch) {
+                // Parse CSV to get partition order (name → index)
+                const _csvLines = existingCsv.replace(/\r\n/g, '\n').split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
+                const _nameToIdx = {};
+                _csvLines.forEach((l, i) => { const p = l.split(',')[0]?.trim(); if (p) _nameToIdx[p] = i; });
+                // Parse each esptool_py_flash_project_args line
+                const _linkRe = /esptool_py_flash_project_args\s*\(\s*(\S+)\s+\S+\s+"([^"]+)"/g;
+                let _m;
+                while ((_m = _linkRe.exec(_blockMatch[1])) !== null) {
+                    const _name = _m[1], _binPath = _m[2];
+                    if (_name in _nameToIdx) _restoredLinks[_nameToIdx[_name]] = _binPath;
+                }
+            }
+        } catch {}
+    }
+
+    panel.webview.html = getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSizeVal, _restoredLinks);
+
+    let _lastSavedLinks = _restoredLinks.length ? JSON.parse(JSON.stringify(_restoredLinks)) : null;
+
+    // Helper: patch CMakeLists.txt with bin links
+    function patchCMakeWithLinks(binLinks, partitionsCsv) {
+        const cmakePath = path.join(root, 'CMakeLists.txt');
+        if (!fs.existsSync(cmakePath)) return;
+        let cmake = fs.readFileSync(cmakePath, 'utf8');
+        cmake = cmake.replace(/\n?# ESP8266 Tools: partition bin links -- BEGIN[\s\S]*?# ESP8266 Tools: partition bin links -- END\n?/g, '');
+        const links = (binLinks || []).map((binPath, i) => binPath ? { binPath, i } : null).filter(Boolean);
+        if (links.length > 0) {
+            const csvLines = (partitionsCsv || '').split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
+            const entries = links.map(({ binPath, i }) => {
+                const parts = (csvLines[i] || '').split(',').map(s => s.trim());
+                const name   = parts[0] || ('part' + i);
+                const offset = parts[3] || '0x0';
+                const cmakeSafePath = binPath.replace(/\\/g, '/');
+                return '    esptool_py_flash_project_args(' + name + ' ' + offset + ' "' + cmakeSafePath + '" FLASH_IN_PROJECT)';
+            }).filter(Boolean);
+            if (entries.length > 0) {
+                cmake += '\n# ESP8266 Tools: partition bin links -- BEGIN\nif(CONFIG_PARTITION_TABLE_CUSTOM)\n' + entries.join('\n') + '\nendif()\n# ESP8266 Tools: partition bin links -- END\n';
+            }
+        }
+        fs.writeFileSync(cmakePath, cmake, 'utf8');
+    }
 
     panel.webview.onDidReceiveMessage(msg => {
         // Always recalculate csvFilename/csvPath in case sdkconfig changed after refresh
         const currentCsvFilename = getPartitionCsvFilename(root);
         const currentCsvPath     = path.join(root, currentCsvFilename);
 
+        if (msg.command === 'setDirty') { _panelIsDirty = msg.dirty; return; }
+
+        if (msg.command === 'warnLinkSize') {
+            vscode.window.showWarningMessage(
+                `ESP: Linked file "${msg.fileName}" (${(msg.fileSize/1024).toFixed(1)} KB) exceeds new partition size (${(msg.partSize/1024).toFixed(1)} KB).`
+            );
+            return;
+        }
+
+        if (msg.command === 'linkBin') {
+            vscode.window.showOpenDialog({
+                canSelectFiles: true, canSelectFolders: false, canSelectMany: false,
+                filters: { 'Binary files': ['bin'], 'All files': ['*'] },
+                title: 'Link .bin file to partition', openLabel: 'Link',
+            }).then(uris => {
+                if (!uris || !uris[0]) return;
+                const binPath = uris[0].fsPath;
+                try {
+                    const fileSize = fs.statSync(binPath).size;
+                    const partSize = msg.partitionSize;
+                    if (partSize && fileSize > partSize) {
+                        vscode.window.showWarningMessage(
+                            `ESP: File size (${(fileSize/1024).toFixed(1)} KB) exceeds partition size (${(partSize/1024).toFixed(1)} KB). Link anyway?`,
+                            'Link anyway', 'Cancel'
+                        ).then(ans => {
+                            if (ans === 'Link anyway') panel.webview.postMessage({ command: 'setBinLink', index: msg.index, binPath, fileSize });
+                        });
+                    } else {
+                        panel.webview.postMessage({ command: 'setBinLink', index: msg.index, binPath, fileSize });
+                    }
+                } catch {
+                    panel.webview.postMessage({ command: 'setBinLink', index: msg.index, binPath, fileSize: 0 });
+                }
+            });
+        }
+
         if (msg.command === 'save') {
             try {
                 fs.writeFileSync(currentCsvPath, msg.csv, 'utf8');
+                const linksChanged = JSON.stringify(msg.binLinks) !== JSON.stringify(_lastSavedLinks);
+                patchCMakeWithLinks(msg.binLinks, msg.csv);
+                _lastSavedLinks = JSON.parse(JSON.stringify(msg.binLinks || []));
                 vscode.window.showInformationMessage(`✅ Saved: ${currentCsvFilename}`);
+                const isCustomPt = getSdkconfigValue(root, 'CONFIG_PARTITION_TABLE_CUSTOM') === 'y';
+                if (linksChanged && isCustomPt) runIdf(['reconfigure'], 'ESP › Reconfigure', false);
             } catch (e) {
-                vscode.window.showErrorMessage(`ESP: Failed to save CSV: ${e.message}`);
+                vscode.window.showErrorMessage(`ESP: Failed to save CSV: \${e.message}`);
             }
         }
         if (msg.command === 'saveWithErrors') {
@@ -3025,9 +3310,14 @@ function cmdPartitionEditor() {
                 if (choice === 'Save') {
                     try {
                         fs.writeFileSync(currentCsvPath, msg.csv, 'utf8');
+                        const linksChanged2 = JSON.stringify(msg.binLinks) !== JSON.stringify(_lastSavedLinks);
+                        patchCMakeWithLinks(msg.binLinks, msg.csv);
+                        _lastSavedLinks = JSON.parse(JSON.stringify(msg.binLinks || []));
                         vscode.window.showInformationMessage(`✅ Saved: ${currentCsvFilename}`);
+                        const isCustomPt2 = getSdkconfigValue(root, 'CONFIG_PARTITION_TABLE_CUSTOM') === 'y';
+                        if (linksChanged2 && isCustomPt2) runIdf(['reconfigure'], 'ESP › Reconfigure', false);
                     } catch (e) {
-                        vscode.window.showErrorMessage(`ESP: Failed to save CSV: ${e.message}`);
+                        vscode.window.showErrorMessage(`ESP: Failed to save CSV: \${e.message}`);
                     }
                 }
             });
@@ -3057,17 +3347,31 @@ function cmdPartitionEditor() {
     _partitionPanel = panel;
     _partitionPanels.add(panel);
     _pushSdkconfigUpdate = pushSdkconfigUpdate; // expose for auto-refresh after menuconfig
+    let _panelIsDirty = false;
+
     panel.onDidChangeViewState(e => {
-        if (e.webviewPanel.visible) pushSdkconfigUpdate();
-        if (e.webviewPanel.visible && _globalBusy) {
-            panel.webview.postMessage({ command: 'setBusy', busy: true, task: _globalBusyName });
+        if (e.webviewPanel.visible) {
+            pushSdkconfigUpdate();
+            if (_globalBusy) {
+                panel.webview.postMessage({ command: 'setBusy', busy: true, task: _globalBusyName });
+            }
         }
     });
-    panel.onDidDispose(() => { _partitionPanels.delete(panel); _partitionPanel = null; _pushSdkconfigUpdate = null; }, null, []);
+    panel.onDidDispose(() => {
+        if (_panelIsDirty) {
+            vscode.window.showWarningMessage(
+                'ESP Partition Editor was closed with unsaved changes.'
+            );
+        }
+        _partitionPanels.delete(panel);
+        _partitionPanel = null;
+        _pushSdkconfigUpdate = null;
+    }, null, []);
 }
 
-function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSizeVal) {
-    const existingData  = JSON.stringify(parseCsvToPartitions(existingCsv));
+function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSizeVal, restoredLinks = []) {
+    const existingData       = JSON.stringify(parseCsvToPartitions(existingCsv));
+    const restoredLinksData  = JSON.stringify(restoredLinks || []);
     const safePtOffset  = String(ptOffsetVal  || '0x8000').replace(/[^0-9xa-fA-F]/g,'');
     const safeFlashSize = String(flashSizeVal || '1048576').replace(/[^0-9]/g,'');
     const safeFilename = (csvFilename || 'partitions.csv').replace(/[<>"']/g, '');
@@ -3161,6 +3465,13 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
   .col-off   { width: 50px; }
   .col-size  { width: 50px; }
   .col-del   { width: 36px; padding: 0; position: relative; }
+  .col-link  { width: 140px; padding: 0 4px; }
+  td.col-link { padding-left: 54px; }
+  .link-btn  { font-size: 11px; padding: 2px 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; display: inline-block; vertical-align: middle; }
+  .link-btn.linked { background: #2d7a2d; color: #fff; border-color: #2d7a2d; }
+  .link-btn.linked:hover { background: #3a9a3a; }
+  .link-clear { background: none; border: none; color: var(--subtitle-fg); font-size: 14px; padding: 2px 4px; cursor: pointer; opacity: 0.5; vertical-align: middle; }
+  .link-clear:hover { color: var(--error); opacity: 1; }
   .page-header  { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px; }
   .page-header > div { flex:1; }
   .refresh-btn  { flex-shrink:0; align-self:center; font-size:12px; padding:4px 14px; opacity:0.8; }
@@ -3168,8 +3479,6 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
   .info-badge { display:inline-block; font-size:13px; cursor:default; }
   .menuconfig-info   { display:inline-flex; flex-direction:column; align-items:flex-start; gap:2px; cursor:default; }
   .menuconfig-label  { color:var(--subtitle-fg); font-size:11px; }
-  .refresh-btn  { flex-shrink:0; align-self:center; font-size:12px; padding:4px 14px; opacity:0.8; }
-  .refresh-btn:hover { opacity:1; }
   .menuconfig-value  { font-family:var(--vscode-editor-font-family,monospace); font-size:13px; background:var(--badge-bg); color:var(--badge-fg); padding:1px 6px; border-radius:3px; }
   .badge-off  { opacity:0.25; }
   .del-btn { position: absolute; right: 15px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--subtitle-fg); font-size: 16px; padding: 2px 4px; cursor: pointer; opacity: 0.5; }
@@ -3212,7 +3521,7 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
     <h2>⚡ ESP Partition Table Editor</h2>
     <p class="subtitle">Visual editor for ESP8266 flash partitions → saves to <code id="csvFilenameLabel" title="Filename from Projectconfig → Partition Table → Custom partition CSV file (CONFIG_PARTITION_TABLE_CUSTOM_FILENAME)">${safeFilename}</code></p>
   </div>
-  <button class="refresh-btn" onclick="vscode.postMessage({command:'refresh'})" title="Reload PT offset, Flash size and CSV filename from Projectconfig">↺ Refresh from Projectconfig</button>
+  <button class="refresh-btn" onclick="vscode.postMessage({command:'refresh'})" title="Reload PT offset, Flash size and partition filename from Projectconfig">↺ Refresh</button>
 </div>
 
 <div class="flash-map-wrap">
@@ -3225,8 +3534,7 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
 
 <div class="toolbar">
   <button onclick="addRow()">＋ Add Partition</button>
-  <button onclick="addPreset('spiffs')"> SPIFFS preset</button>
-  <button onclick="resetDefault()">↺ Default preset</button>
+  <button onclick="resetDefault()">↺ Default Partition</button>
   <button onclick="autoOffsets();render();" title="Recalculate all offsets sequentially from PT end, respecting 1MB boundary">⟳ Auto Offsets</button>
   <div style="flex:1"></div>
   <span class="menuconfig-info" title="Partition Table Offset\nSource: menuconfig → Partition Table → Offset (CONFIG_PARTITION_TABLE_OFFSET)">
@@ -3238,7 +3546,7 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
     <code id="flashSizeDisplay" class="menuconfig-value">${safeFlashSize === '524288' ? '512 KB' : safeFlashSize === '1048576' ? '1 MB' : safeFlashSize === '2097152' ? '2 MB' : safeFlashSize === '4194304' ? '4 MB' : safeFlashSize + ' B'}</code>
     <input type="hidden" id="flashSizeSel" value="${safeFlashSize}"/>
   </span>
-  <button class="primary" id="saveCsvBtn" onclick="save()">💾 Save CSV</button>
+  <button class="primary" id="saveCsvBtn" onclick="save()">💾 Save</button>
 
 </div>
 
@@ -3252,6 +3560,7 @@ function getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSize
     <th class="col-sub">SubType</th>
     <th class="col-off">Offset</th>
     <th class="col-size">Size</th>
+    <th class="col-link">Link to bin</th>
     <th class="col-del"></th>
   </tr>
 </thead>
@@ -3266,15 +3575,18 @@ const vscode = acquireVsCodeApi();
 
 const COLORS =['#4ec9b0','#569cd6','#c586c0','#dcdcaa','#ce9178','#9cdcfe','#4fc1ff','#b5cea8','#f44747','#cca700'];
 const APP_SUBTYPES  =['factory','ota_0','ota_1'];
-const DATA_SUBTYPES =['nvs','ota','phy','nvs_keys','coredump','esphttpd','fat','spiffs'];
+const DATA_SUBTYPES =['nvs','ota','phy','fat','spiffs'];
 
 let partitions = ${existingData};
 let dragSrc = null;
+let binLinks = ${restoredLinksData};  // restored from CMakeLists.txt
+let binFileSizes = new Array(binLinks.length).fill(0);
 
 if (!partitions.length) resetDefault();
 render();
 
 function resetDefault() {
+  setDirty();
   // ESP8266 hardware limit: app partition MUST NOT cross 1MB boundary.
   // factory starts at 0x10000, so max size = 0x100000 - 0x10000 = 0xF0000 (960KB).
   // Remaining flash (if any) is left free for user to add data partitions.
@@ -3362,6 +3674,11 @@ function validate() {
     if (p.type !== 'app' && p.type !== 'data') {
       const t = parseSize(p.type);
       if (!isNaN(t) && t < 0x40)   errors.push(\`Row \${i+1} "\${p.name}": custom type \${fmtHex(t)} is in reserved range 0x00-0x3F (SDK use only). Use 0x40-0xFE.\`);
+      if (!isNaN(t) && t > 0xFE)   errors.push(\`Row \${i+1} "\${p.name}": custom type \${fmtHex(t)} exceeds max allowed value 0xFE.\`);
+      // Validate custom subtype
+      const st = parseSize(p.subtype);
+      if (isNaN(st))                errors.push(\`Row \${i+1} "\${p.name}": invalid subtype "\${p.subtype}" — must be hex (0x00-0xFE) or decimal (0-254).\`);
+      else if (st > 0xFE)           errors.push(\`Row \${i+1} "\${p.name}": subtype \${fmtHex(st)} exceeds max allowed value 0xFE (subtype is uint8_t).\`);
     }
     
     if (!isNaN(off) && !isNaN(sz)) {
@@ -3415,6 +3732,7 @@ function validate() {
 }
 
 function render() {
+  syncLinks();
   renderTable();
   renderMap();
   renderStatus();
@@ -3460,7 +3778,7 @@ function renderTable() {
         <select onchange="update(\${i},'type',this.value)">
           <option \${p.type==='app' ?'selected':''}>app</option>
           <option \${p.type==='data'?'selected':''}>data</option>
-
+          <option \${p.type!=='app'&&p.type!=='data'?'selected':''} value="\${p.type!=='app'&&p.type!=='data'?p.type:'0x40'}">custom…</option>
         </select>
       </td>
       <td class="col-sub">
@@ -3485,6 +3803,12 @@ function renderTable() {
         <span class="size-hint" id="sh\${i}"></span>
       </td>
 
+      <td class="col-link">
+        \${binLinks[i]
+          ? \`<span title="\${binLinks[i]}"><button class="link-clear" onclick="clearLink(\${i})" title="Remove link" style="margin-right:6px">✕</button><button class="link-btn linked" onclick="linkBin(\${i})" title="\${binLinks[i]}">\${binLinks[i].replace(/\\\\/g,'/').split('/').pop()}</button></span>\`
+          : \`<button class="link-btn" onclick="linkBin(\${i})" title="Link a .bin file to this partition">+ Link bin</button>\`
+        }
+      </td>
       <td class="col-del">
         <button class="del-btn" onclick="delRow(\${i})" title="Delete">✕</button>
       </td>
@@ -3501,7 +3825,7 @@ function renderTable() {
     tr.addEventListener('dragend',   e => { tr.draggable = false; tr.classList.remove('row-dragging'); document.querySelectorAll('.row-dragover').forEach(r=>r.classList.remove('row-dragover')); });
     tr.addEventListener('dragover',  e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; tr.classList.add('row-dragover'); });
     tr.addEventListener('dragleave', e => { if (!tr.contains(e.relatedTarget)) tr.classList.remove('row-dragover'); });
-    tr.addEventListener('drop',      e => { e.preventDefault(); tr.classList.remove('row-dragover'); if (dragSrc !== null && dragSrc !== i) { const moved = partitions.splice(dragSrc,1)[0]; partitions.splice(i,0,moved); dragSrc=null; render(); }});
+    tr.addEventListener('drop',      e => { e.preventDefault(); tr.classList.remove('row-dragover'); if (dragSrc !== null && dragSrc !== i) { const moved = partitions.splice(dragSrc,1)[0]; partitions.splice(i,0,moved); const movedLink = binLinks.splice(dragSrc,1)[0]; binLinks.splice(i,0,movedLink); const movedSize = binFileSizes.splice(dragSrc,1)[0]; binFileSizes.splice(i,0,movedSize); dragSrc=null; render(); }});
 
     tbody.appendChild(tr);
 
@@ -3621,9 +3945,26 @@ function renderErrors() {
   box.style.display = errors.length ? 'block' : 'none';
 }
 
+function setDirty() {
+  vscode.postMessage({ command: 'setDirty', dirty: true });
+}
+
 function update(i, field, value) {
   partitions[i][field] = value;
-  
+  setDirty();
+
+  if (field === 'size' && binLinks[i] && binFileSizes[i]) {
+    const newSize = parseSize(value);
+    if (!isNaN(newSize) && newSize > 0 && binFileSizes[i] > newSize) {
+      vscode.postMessage({
+        command: 'warnLinkSize',
+        fileName: binLinks[i].replace(/\\\\/g, '/').split('/').pop(),
+        fileSize: binFileSizes[i],
+        partSize: newSize
+      });
+    }
+  }
+
   if (field === 'type') {
     if (value === 'app')  partitions[i].subtype = 'factory';
     else if (value === 'data') partitions[i].subtype = 'nvs';
@@ -3635,6 +3976,7 @@ function update(i, field, value) {
 }
 
 function addRow() {
+  setDirty();
   let maxEnd = 0;
   partitions.forEach(p => {
     const off = parseSize(p.offset), sz = parseSize(p.size);
@@ -3642,43 +3984,20 @@ function addRow() {
   });
   if (maxEnd % 4096 !== 0) maxEnd = Math.ceil(maxEnd/4096)*4096;
   if (maxEnd === 0) maxEnd = getPtEnd();
-  partitions.push({ name:'new_part', type:'data', subtype:'nvs', offset: fmtHex(maxEnd), size:'0x10000', encrypted:false });
+  // Generate unique name
+  const existingNames = new Set(partitions.map(p => p.name));
+  let newName = 'new_part';
+  let counter = 1;
+  while (existingNames.has(newName)) { newName = 'new_part_' + counter++; }
+  partitions.push({ name: newName, type:'data', subtype:'nvs', offset: fmtHex(maxEnd), size:'0x10000', encrypted:false });
   render();
 }
 
-function addPreset(name) {
-  const flashSize = parseInt(document.getElementById('flashSizeSel').value || '1048576');
-
-  if (name === 'spiffs') {
-    // Classic ESP8266 SPIFFS layout:
-    // 1MB: factory 512KB (0x80000) + SPIFFS 448KB (0x70000)
-    // 2MB: factory 512KB (0x80000) + SPIFFS 1.5MB (0x170000)
-    // 4MB: factory 1MB   (0x100000) + SPIFFS 3MB  (0x300000)
-    let appSize, spiffsOff, spiffsSize;
-    if (flashSize <= 0x100000) {         // 1MB
-      appSize    = 0x80000;
-      spiffsOff  = 0x90000;
-      spiffsSize = 0x70000;
-    } else if (flashSize <= 0x200000) {  // 2MB
-      appSize    = 0x80000;
-      spiffsOff  = 0x90000;
-      spiffsSize = 0x170000;
-    } else {                             // 4MB+
-      appSize    = 0x100000;
-      spiffsOff  = 0x110000;
-      spiffsSize = flashSize - 0x110000;
-    }
-    partitions = [
-      { name:'nvs',      type:'data', subtype:'nvs',    offset:'0x9000',  size:'0x6000',  encrypted:false },
-      { name:'phy_init', type:'data', subtype:'phy',    offset:'0xf000',  size:'0x1000',  encrypted:false },
-      { name:'factory',  type:'app',  subtype:'factory',offset:'0x10000', size:'0x' + appSize.toString(16).toUpperCase(),    encrypted:false },
-      { name:'spiffs',   type:'data', subtype:'spiffs', offset:'0x' + spiffsOff.toString(16).toUpperCase(), size:'0x' + spiffsSize.toString(16).toUpperCase(), encrypted:false }
-    ];
-    render();
-  }
-}
 function delRow(i) {
+  setDirty();
   partitions.splice(i, 1);
+  binLinks.splice(i, 1);
+  binFileSizes.splice(i, 1);
   render();
 }
 
@@ -3695,22 +4014,34 @@ function toCsv() {
   return lines.join('\\n') + '\\n';
 }
 
+function linkBin(i) {
+  vscode.postMessage({ command: 'linkBin', index: i, partitionSize: parseSize(partitions[i].size), partitionOffset: partitions[i].offset });
+}
+function clearLink(i) {
+  binLinks[i] = null;
+  binFileSizes[i] = 0;
+  setDirty();
+  render();
+}
+
+// Keep binLinks same length as partitions
+function syncLinks() {
+  while (binLinks.length < partitions.length) { binLinks.push(null); binFileSizes.push(0); }
+  binLinks.length = partitions.length;
+  binFileSizes.length = partitions.length;
+}
+
 function save() {
   const errors = validate();
   if (errors.length) {
-    // Post message to extension host which uses showWarningMessage (works in webview)
-    vscode.postMessage({ command: 'saveWithErrors', csv: toCsv(), errors: errors });
+    vscode.postMessage({ command: 'saveWithErrors', csv: toCsv(), errors: errors, binLinks: binLinks });
     return;
   }
-  vscode.postMessage({ command: 'save', csv: toCsv() });
+  vscode.postMessage({ command: 'setDirty', dirty: false });
+  vscode.postMessage({ command: 'save', csv: toCsv(), binLinks: binLinks });
 }
 
-function openCsv() {
-  vscode.postMessage({ command: 'open' });
-}
-function refreshFromMenuconfig() {
-  vscode.postMessage({ command: 'refresh' });
-}
+
 window.addEventListener('message', e => {
   const msg = e.data;
   if (msg.command === 'setBusy') {
@@ -3721,6 +4052,13 @@ window.addEventListener('message', e => {
       btn.style.opacity = msg.busy ? '0.4' : '';
       btn.style.cursor  = msg.busy ? 'not-allowed' : '';
     }
+    return;
+  }
+  if (msg.command === 'setBinLink') {
+    binLinks[msg.index] = msg.binPath;
+    binFileSizes[msg.index] = msg.fileSize || 0;
+    setDirty();
+    render();
     return;
   }
   if (msg.command !== 'sdkconfigUpdate') return;

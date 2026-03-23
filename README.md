@@ -1,128 +1,114 @@
 # ESP8266 / ESP8285 Tools
 
 A convenient VS Code extension for developing with **ESP8266** and **ESP8285** chips.  
-Supports both **ESP8266_RTOS_SDK** (`idf.py`) and **ESP8266_NonOS_SDK** (`make`).
+Supports **ESP8266_RTOS_SDK** via `idf.py`.
 
 ---
 
 ## Features
 
 ### ⚙️ Build
-- **Build** — full project build
+- **Build** — full project build with configurable pre/post actions
 - **Build App** — application only
 - **Build Bootloader** — bootloader only
 - **Build Partition Table** — partition table only
 - Auto-saves all unsaved files before build
+- Pre-build action: none / clean / full clean (Build only)
+- Post-build action: none / flash / flash app
+- Optional post-build analysis: size / size-components / size-files
+- COM port verified before build when post-build flash is selected
 
 ### ⚡ Flash
-- **Flash** — flash firmware to device
-- **Flash App / Bootloader / Partition Table** — flash individual components
-- **Flash Encrypted / Flash Encrypted App** — encrypted flash variants
+- **Flash** — flash full firmware to device
+- **Flash App** — flash application only
+- **Flash Bootloader** — flash bootloader only
+- **Flash Partition Table** — flash partition table only
 - **Erase Flash** — full flash erase
-- Port availability check before flashing — prompts to select another port if device not connected
+- Configurable erase before flash (Flash only)
+- Configurable action after flash: none / monitor
+- Port availability check before flashing
 
 ### 🖥️ Monitor
-- **Monitor** — open serial monitor
-- **Stop Monitor** — close serial monitor
+- **Monitor** — toggles between start/stop (button changes state)
+- Status bar shows Monitor button — red when running
 - Configurable baud rate
-- Port availability check before opening monitor
 
 ### 🔧 SDK Configure
 - **Menuconfig** — visual configuration (`idf.py menuconfig`)
-- **Reconfigure** — re-run CMake configuration
-- **Reset Config** — delete sdkconfig and restore defaults
+- **Reconfigure** — re-run CMake
+- **Reset Projectconfig** — delete `sdkconfig` and restore defaults on next build
 
 ### 📁 Project Folder
-- Shows active project name
-- **📦 Components** — automatically lists `components/` subfolders
-  - `[+]` button — launch **Add Component** wizard
-  - `[✏️]` button — edit component (rename, sources, headers, dependencies)
-  - `[🗑]` button — delete component with confirmation
+- Shows active project name with ✏️ edit button (edits `main/CMakeLists.txt`)
+- **📦 Components** — always visible, lists `components/` subfolders
+  - `[+]` button — **Create New Component** wizard
+  - `[✏️]` button — edit component
+  - `[🗑]` button — delete component
 
-### ➕ Add Component Wizard (RTOS SDK only)
-Creates a new ESP-IDF component in `components/` with 4 steps:
-1. Component name
-2. Source `.c` files
-3. Header location: `include/` folder, same folder `./`, or none
-4. `REQUIRES` dependencies
+### ➕ Create New Component Wizard
+4 steps: name → source files → header location → REQUIRES dependencies
 
-Generates:
-- `components/<name>/CMakeLists.txt` with correct `idf_component_register()`
-- `.c` source stub
-- `.h` header stub (if selected)
-
-> No changes to root `CMakeLists.txt` needed — ESP-IDF SDK auto-detects `components/`
-
-### ✏️ Edit Component Wizard (RTOS SDK only)
-Edits an existing component — opens pre-filled wizard with 4 steps:
-1. **Rename** — rename the component folder (leave unchanged to skip)
-2. **Source files** — pre-filled from existing `CMakeLists.txt`
-3. **Header location** — pre-selected from existing config
-4. **REQUIRES dependencies** — pre-filled from existing config
-
-Updates `CMakeLists.txt` in place. Creates any new source files that don't exist yet.
+### ➕ Create New Project Wizard
+4 steps: parent folder → project name → header location → REQUIRES dependencies  
+Generates `CMakeLists.txt`, `main.c`, header stub.
 
 ### 🛠️ Utilities
-- **Make SPIFFS** — pack `data/` folder into SPIFFS image using `mkspiffs`
+- **Make SPIFFS** — pack any folder into a SPIFFS binary image using `mkspiffs`
+  - Opens folder picker (defaults to project root)
+  - Calculates image size automatically (`folder size × 2 + 4096`, min 16 KB)
+  - Warns if image exceeds project flash size
+  - Saves `<foldername>.bin` to project root
+  - `mkspiffs` installed automatically if not found
 - **Custom Partitions** — open partition table editor
 
 > ### 🗂️ Partition Table Editor
 >
-> Visual editor for ESP8266 flash partition tables.  
-> Drag-and-drop reordering, flash map visualization, presets, validation and CSV support.
+> Visual editor for ESP8266 flash partition tables.
+> Drag-and-drop reordering, flash map visualization, presets, validation and auto-patching.
 >
-> - Drag-and-drop partition reordering
+> - Drag-and-drop partition reordering (drag handle `⠿`)
 > - Flash map visualization
-> - **OTA preset** — auto-selects 1MB or 2MB+ layout based on flash size
-> - **SPIFFS preset** — classic layout: nvs + phy_init + factory (512KB) + spiffs (rest)
-> - **Default preset** — standard single factory app (960KB max due to ESP8266 1MB boundary)
-> - Auto Offsets — automatic offset calculation
-> - Validation with ESP8266-specific checks (1MB app boundary, alignment, overlaps)
-> - CSV save/open
+> - **Default Partition** — standard single factory app layout
+> - **Auto Offsets** — automatic offset recalculation from PT end
+> - Reads PT offset, flash size and CSV filename from `sdkconfig` automatically
+> - **Link to bin** — link any `.bin` file to a partition
+> - Unsaved changes warning on close
+> - New partitions get unique names automatically
+> - Validation: alignment, overlaps, name length, duplicate names, custom subtype range (0x00–0xFE)
+> - TYPE: `app` / `data` / `custom…` (hex subtype 0x00–0xFE)
+> - DATA subtypes: `nvs`, `ota`, `phy`, `fat`, `spiffs`
+> - APP subtypes: `factory`, `ota_0`, `ota_1`
 
-### ⚗️ Advanced (Experimental)
-- eFuse Common / Custom Table generation
-- OTA data erase / read
-- Show eFuse Table
+
+
+### 📊 Analysis
+- **Size** — firmware size report
+- **Size Components** — per-component breakdown
+- **Size Files** — per-file breakdown
 
 ### 🔧 VSCode Utilities
-- **Generate IntelliSense** — creates `.vscode/c_cpp_properties.json` with correct ESP8266 includes
+- **Generate IntelliSense** — creates `.vscode/c_cpp_properties.json`
 - **Generate tasks.json** — adds ESP build tasks for `Ctrl+Shift+B`
+
+### 📊 Status Bar
+Quick access buttons: **Build** → **Flash** → **Clean** → **Monitor** → **COM port**
 
 ---
 
 ## Requirements
 
-### For ESP8266_RTOS_SDK (idf.py):
-- [Python 3.7.x](https://www.python.org/downloads/release/python-379/) — **must be 3.7.x**, newer versions are not compatible with ESP8266 SDK
-- [ESP8266_RTOS_SDK](https://github.com/espressif/ESP8266_RTOS_SDK) — download and set path via extension settings
-
-### For ESP8266_NonOS_SDK (make):
-- [ESP8266_NonOS_SDK](https://github.com/espressif/ESP8266_NONOS_SDK) — set path via extension settings
-- `make` toolchain in PATH
+- [Python 3.7.x](https://www.python.org/downloads/release/python-379/) — **must be 3.7.x**
+- [ESP8266_RTOS_SDK](https://github.com/espressif/ESP8266_RTOS_SDK)
 
 ---
 
-## Setup (Fresh Install)
+## Setup
 
-1. Install the extension — sidebar shows the full command tree immediately
-2. **Install Python 3.7** — click ⚠️ Python 3.7 not found in sidebar → Download Python 3.7
-3. **Set up SDK** — in sidebar, click **RTOS IDF: not set** or **NonOS SDK: not set** and point to your SDK folder
-4. **Install build tools** — extension detects missing tools and offers to install automatically
-5. Select your COM port via **Serial Source Settings → Port**
-6. Run **Build** → **Flash** → **Monitor**
-
----
-
-## Command Check Order
-
-Every command verifies prerequisites in this order before executing:
-
-1. **Python 3.7** — if not found, shows download prompt
-2. **IDF path** — if not set, shows settings prompt
-3. **Build tools** — if missing, offers automatic installation
-4. **Project folder** — if not selected, shows folder picker
-5. **COM port** — if not connected, shows port selector
+1. Install the extension
+2. Set SDK path — click **RTOS IDF: not set** in sidebar
+3. Install build tools — extension installs automatically via `idf_tools.py`
+4. Select COM port via **Serial Source Settings → Port**
+5. Run **Build** → **Flash** → **Monitor**
 
 ---
 
@@ -131,18 +117,19 @@ Every command verifies prerequisites in this order before executing:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `esp-idf-tools.idfPath` | Path to ESP8266_RTOS_SDK | |
-| `esp-idf-tools.nonosSdkPath` | Path to ESP8266_NonOS_SDK | |
-| `esp-idf-tools.sdkType` | SDK type: `auto`, `rtos`, `nonos` | `auto` |
-| `esp-idf-tools.pythonPath` | Manual path to Python 3.7 folder | |
-| `esp-idf-tools.comPort` | COM port (e.g. `COM3` or `/dev/ttyUSB0`) | |
+| `esp-idf-tools.pythonPath` | Manual path to Python 3.7 | |
+| `esp-idf-tools.comPort` | COM port (`COM3` or `/dev/ttyUSB0`) | |
 | `esp-idf-tools.flashBaud` | Flash baud rate | `115200` |
 | `esp-idf-tools.flashSize` | Flash size | `2MB` |
-| `esp-idf-tools.flashMode` | SPI flash mode (`dio`, `qio`, …) | `dio` |
+| `esp-idf-tools.flashMode` | SPI flash mode | `dio` |
 | `esp-idf-tools.flashFreq` | SPI flash frequency | `40m` |
-| `esp-idf-tools.monitorBaud` | Serial monitor baud rate | `74880` |
-| `esp-idf-tools.postBuildAction` | Auto action after build (`none`, `flash`, `flash_monitor`) | `none` |
-| `esp-idf-tools.postFlashAction` | Auto action after flash (`none`, `monitor`) | `none` |
-| `esp-idf-tools.useCompressedUpload` | Use compressed upload (`-z`) | `true` |
+| `esp-idf-tools.monitorBaud` | Monitor baud rate | `74880` |
+| `esp-idf-tools.eraseBeforeFlash` | Erase flash before flashing | `false` |
+| `esp-idf-tools.postFlashAction` | After flash: `none` / `monitor` | `none` |
+| `esp-idf-tools.postBuildAction` | After build: `none` / `flash` / `app_flash` | `none` |
+| `esp-idf-tools.useCompressedUpload` | Compressed upload (`-z`) | `true` |
+| `esp-idf-tools.overrideFlashConfig` | Use manual flash settings | `false` |
+| `esp-idf-tools.reuseTerminal` | Reuse existing terminal | `true` |
 | `esp-idf-tools.saveSettingsToWorkspace` | Save settings per-project | `true` |
 
 ---
@@ -152,6 +139,14 @@ Every command verifies prerequisites in this order before executing:
 - ✅ Windows 10/11 (PowerShell)
 - ✅ Linux (bash)
 - ✅ macOS (bash/zsh)
+
+---
+
+## Links
+
+- [GitHub Repository](https://github.com/Dzantemir/esp8266-esp8285-Tools)
+- [ESP8266_RTOS_SDK](https://github.com/espressif/ESP8266_RTOS_SDK)
+- [Report Issues](https://github.com/Dzantemir/esp8266-esp8285-Tools/issues)
 
 ---
 

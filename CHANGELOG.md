@@ -1,177 +1,264 @@
 # Changelog
 
-## [0.9.34]
-- Code optimization: extracted warnNoProject() helper (was duplicated 5×) and pipInstallReqsParts() helper (was duplicated 4×); compacted install parts arrays
+## [1.4.4]
+- Code cleanup: merged duplicate `onDidReceiveMessage` handlers in Partition Editor
+- Code cleanup: moved `_lastSavedLinks` and `patchCMakeWithLinks` outside message handler (critical bug fix)
+- Code cleanup: removed duplicate `setBinLink` handler in webview JS
+- Code cleanup: removed duplicate `.refresh-btn` CSS
+- Code cleanup: removed dead functions `openCsv`, `refreshFromMenuconfig`, `addPreset`
 
-- Code cleanup: removed dead checkSdkInstalled(), duplicate comments, stale depsPy alias, unused params, simplified else-if chain, fixed misplaced section headers
+## [1.4.3]
+- Partition Editor: `setDirty()` now also triggered when linking or removing a bin file
 
-- Partition Editor: removed "Refresh From Menuconfig" button — now auto-refreshes PT offset and Flash size automatically when menuconfig finishes
+## [1.4.2]
+- Partition Editor: unsaved changes warning shown when editor is closed without saving
 
-- checkPythonDeps: already present in all commands (runIdf, runMake, runNonosFlash, runNonosMonitor). Removed duplicate call in runFlash (was calling runIdf which already checks)
+## [1.4.1]
+- Partition Editor: new partitions now get unique names (`new_part`, `new_part_1`, ...)
 
-- Refresh: fixed — checkAndInstallTools(false) now always called, not blocked by checkEnvironment returning false when Python missing
+## [1.4.0]
+- Partition Editor: Link to bin button turns green when a file is linked
 
-- Refresh: fixed double popup — checkEnvironment stays silent, checkAndInstallTools(false) shows Python error with Set/Download buttons
+## [1.3.9]
+- Partition Editor: added unsaved changes tracking — warns on close if changes were not saved
 
-- Refresh button: changed checkEnvironment(true→false) — now shows popup if Python not found or other issues
+## [1.3.8]
+- Partition Editor: Link to bin button color changes to green when linked
 
-- pip install: added --user flag to all 6 occurrences — matches SDK recommendation
+## [1.3.7]
+- Partition Editor: removed emoji from link button (display issue in webview)
 
-- Requirements check: fixed quoting for cmd.exe — cp.exec uses cmd.exe on Windows which requires double quotes, not single quotes from q()
+## [1.3.6]
+- Partition Editor: `reconfigure` now runs only when bin links actually changed
 
-- Requirements check: removed unnecessary PYTHON env var — check_python_dependencies.py does not use it
+## [1.3.5]
+- Partition Editor: fixed save notification showing `${currentCsvFilename}` as literal text
 
-- Requirements check: simplified — call check_python_dependencies.py exactly as idf.py does (IDF_PATH + PYTHON in env, no extra args)
+## [1.3.4]
+- Partition Editor: fixed Windows backslash paths in generated CMakeLists.txt
 
-- Requirements check: fixed root cause — check_python_dependencies.py does not filter blank lines/comments, pkg_resources.require("") always throws. Now writes filtered temp file and passes via --requirements
+## [1.3.3]
+- Partition Editor: new **Link to bin** column — link any `.bin` file to a partition
+- Partition Editor: on Save, automatically patches `CMakeLists.txt` with `esptool_py_flash_project_args` and runs `reconfigure`
+- Partition Editor: link persists during editor session; cleared on close
 
-- Requirements check: fixed env — now passes both IDF_PATH and PYTHON vars, exactly as idf.py does
+## [1.3.2]
+- Sidebar: Flash Bootloader and Flash Part. Table now have the same configure menu as Flash App (Monitor after flash)
 
-- Requirements check: reverted to check_python_dependencies.py with IDF_PATH properly set in env — check only, no installation
+## [1.3.1]
+- Sidebar: Build App, Build Bootloader, Build Part. Table configure menu now has 2 steps (no pre-build clean step)
+- Sidebar: Build configure menu retains 3 steps including pre-build clean
 
-- Requirements check: replaced check_python_dependencies.py (uses pkg_resources which misses site-packages) with `pip install -r requirements.txt --quiet` — reliable on all Python configs
+## [1.3.0]
+- Sidebar: Build App, Build Bootloader, Build Part. Table — removed configure button (no pre-build clean needed for partial builds)
 
-- Requirements check: runs check_python_dependencies.py at startup and on Refresh with IDF_PATH set — same as idf.py. Shows Install dialog only if failed
+## [1.2.9]
+- Partition Editor: renamed `↺ Default` button to `↺ Default Partition`
 
-- Removed automatic requirements check — was causing false positives on all configurations. idf.py reports missing packages in terminal with exact install command
+## [1.2.8]
+- Make SPIFFS: warning threshold now uses project flash size from settings instead of hardcoded 4MB
 
-- Requirements check: fixed — removed _toolsVerified=false after install (was causing dialog to reappear on every Build after install)
+## [1.2.7]
+- Partition Editor: updated Refresh button tooltip to mention partition filename
 
-- Requirements check: stopped using check_python_dependencies.py (does not filter comment/blank lines → always fails). Own script with proper filtering: skips comments, ignores VersionConflict, only DistributionNotFound triggers dialog
+## [1.2.6]
+- Partition Editor: restored `saves to <filename>` in subtitle
+- Partition Editor: renamed `↺ Default preset` back to `↺ Default`
 
-- Requirements check: pass --requirements flag to check_python_dependencies.py — no longer needs IDF_PATH env var
+## [1.2.5]
+- Partition Editor: removed SPIFFS preset button
+- Partition Editor: `↺ Refresh from Projectconfig` → `↺ Refresh`
+- Partition Editor: `💾 Save CSV` → `💾 Save`
 
-- Requirements check: now uses SDK's own check_python_dependencies.py — 100% matches what idf.py checks. Offers Install on failure, blocks build until fixed
+## [1.2.4]
+- Partition Editor: removed `nvs_keys`, `coredump`, `esphttpd` from DATA_SUBTYPES (ESP32-only, not supported on ESP8266)
 
-- Removed automatic requirements.txt check — idf.py already checks and reports missing packages with exact install command
+## [1.2.3]
+- Partition Editor: added validation for custom subtype — must be 0x00–0xFE (uint8_t)
 
-- Requirements check: result cached in globalState — check runs once, remembered across VSCode restarts. Cache resets when IDF path changes
+## [1.2.2]
+- Partition Editor: restored `custom…` option in TYPE dropdown
 
-- Requirements check: fixed false positives — proper indented script, catches ALL exceptions per-package (VersionConflict, InvalidVersion etc.), outer try/except so any pkg_resources error defaults to OK
+## [1.2.1]
+- Partition Editor: restored custom subtype input field for custom type partitions
 
-- Requirements check: fixed VersionConflict false positive (e.g. cryptography>=35 installed but requirements.txt says <35) — now only DistributionNotFound triggers dialog
+## [1.2.0]
+- Sidebar: renamed `ESP › Create Component` to `ESP › Create New Component`
 
-- Requirements check: fixed — now writes temp .py script with proper filtering (blank lines, comments stripped before pkg_resources.require)
-- Check runs at startup (silent if OK) and on first Build — no false positives
+## [1.1.9]
+- Linux: removed `--user` flag from all `pip install` commands (incompatible with venv)
 
-- Reverted: removed automatic requirements.txt check — was causing false positives
+## [1.1.8]
+- Create New Project wizard: added Step 3 (include folder) and Step 4 (REQUIRES dependencies)
+- Create New Project: generates header file stub based on include choice
+- Sidebar: added ✏️ edit button next to project folder — edits `main/CMakeLists.txt` (includes and REQUIRES)
 
-- Requirements check: replaced `idf_tools.py check-python-dependencies` with `pkg_resources.require()` — works correctly in Python 3.7, no false positives
-- Requirements check runs at startup (after tools verified) AND on first Build — shows dialog only when actually missing
+## [1.1.7]
+- package.json: fixed malformed `ESP NonOS › Flash` entry without `command` field
 
-- Requirements check: moved back to Build/Flash only — dialog appears on first Build press, not at startup
+## [1.1.6]
+- package.json: added missing `esp.resetConfig` command declaration
 
-- Requirements check moved to startup (checkAndInstallTools) — dialog appears once at startup, not on every Build
-- Build: _toolsVerified already true by the time Build runs — no repeated dialogs
+## [1.1.5]
+- Code cleanup: removed dead NonOS references, `isRtos` variable, `esp.flashMonitor` command
+- Code cleanup: removed NONOS SDK branch from `showRtosSdkInfo`
 
-- Build: fixed cyclic requirements warning — _toolsVerified now set immediately on any answer (Install or Skip), dialog shows only once per session
+## [1.1.4]
+- Status bar: reordered buttons — Build → Flash → Clean → Monitor → COM port
 
-- Build: fixed requirements check — now uses `idf_tools.py check-python-dependencies` (same as idf.py itself) instead of `pip check`
-- Build: if requirements not satisfied — blocks build and offers Install button
+## [1.1.3]
+- Status bar: added Clean button
 
-- Add Component / Edit Component: removed Python check — these are file operations, only project folder is required
+## [1.1.2]
+- Sidebar: Components group always visible when project is selected (even if empty)
+- Sidebar: Create Component (`+`) button moved to Components group
+- Status bar: COM port moved to last position
 
-- Build: fixed requirements check — replaced `pip install --dry-run` (not supported in pip<21) with `pip check` (works with Python 3.7)
+## [1.1.1]
+- Status bar / Sidebar: Monitor button text always shows `Monitor`; tooltip changes between `Start Monitor` and `Stop Monitor`
 
-- Build: added requirements.txt check before build — if Python packages not satisfied, offers to install automatically (was silently failing at idf.py build step)
+## [1.1.0]
+- Sidebar: Monitor button toggles between start/stop states
+- Status bar: added Build, Flash, Monitor buttons
+- Monitor: status bar Monitor button turns red when monitor is running
 
-- Components: Edit wizard — added Step 0 "Rename" — renames the component folder (leave unchanged to skip)
-- Components: success message shows "renamed → new_name" when folder was renamed
+## [1.0.9]
+- Linux: removed `--user` from pip install (venv compatibility)
 
-- Components: added ✏️ Edit button next to each component — opens pre-filled wizard (Source files, Header location, REQUIRES)
-- Components: Edit wizard reads existing CMakeLists.txt and pre-fills all fields
+## [1.0.8]
+- Sidebar: project folder now has ✏️ edit button
+- Create New Project: step numbering fixed (2 steps after SDK choice removal)
 
-- Sidebar: removed ⚠️ Python warning from tree — shown only when a command is invoked
+## [1.0.7]
+- Partition Editor: Refresh button tooltip updated
 
-## [0.9.2]
-- Sidebar: full tree always visible even without project folder selected — commands show error only when needed
-- Check order: all commands now follow strict sequence: Python → IDF path → Tools → Project folder → Port
-- Port check dialog: removed "Flash anyway" button — only "Select another port" or Cancel
-- Port check: added to NONOS Monitor (was missing)
-- Startup: no more double notifications — environment check runs silently, warnings appear only in sidebar tree
-- Startup: `checkAndInstallTools` now runs silently (no popup if Python not found at startup)
-- Python error: unified — shown only once per command (removed duplicate messages from individual commands)
-- Project folder error: unified message "ESP: Select project folder!" with "Select Folder" button in all 6 places
-- pip install: status bar busy spinner shown during installation
-- `version.txt`: validation now uses same regex as `idf_tools.py` (`v\d+\.\d+`) — reads first 16 bytes
-- `version.txt`: removed `.git` folder check — was irrelevant to file content validity
-- Code: removed unused `_busyCommands` variable
-- Code: removed redundant `checkBusy()` call in `runWithPostFlash`
-- New extension icon
+## [1.0.6]
+- Fixed: `activeSdk is not defined` error in Create New Project wizard
+- Create New Project: removed SDK type selection step (always RTOS)
 
-## [1.9.1]
-- Environment check on startup: validates Git, Python 3.7, SDK — shows warnings in sidebar tree
-- Sidebar warnings: ⚠️ Git not installed / ⚠️ Python 3.7 not found — click to fix
-- SDK setup: RTOS IDF and NonOS SDK buttons now offer **Clone via Git** option (only shown when Git is installed)
-- Clone SDK: select target folder → `git clone --recursive` → auto-sets SDK path → auto-installs tools
-- All commands (Build, Flash, Monitor, Clone) blocked while another command is running
-- Build: checks Git and Python before starting — shows actionable error with download link if missing
-- Build: fresh Python check on every run (bypasses cache) — detects if Python was uninstalled
-- Install Tools: checks Python availability before starting installation
-- Python error message: added hint to check "Add Python to PATH" during setup
-- VSCode window focus: silently re-checks environment when returning from another app
-- Removed setuptools==69.5.1 workaround (not needed with Python 3.7)
+## [1.0.5]
+- Partition Editor: APP_SUBTYPES trimmed to `factory`, `ota_0`, `ota_1` only
+- Partition Editor: removed `custom…` TYPE option and custom subtype input
 
-## [1.9.0]
-- Project Folder: added **Components** subgroup — shows `components/` folder contents automatically
-- Project Folder: inline `[+]` button on "Project Folder" header — launches Add Component wizard
-- Project Folder: inline `[🗑]` button on each component — deletes with confirmation dialog
-- Add Component wizard: 4-step wizard (name → source files → headers → REQUIRES)
-- Add Component: generates `CMakeLists.txt` with correct `idf_component_register()`, `.c` and `.h` stubs
-- Add Component: shows warning and exits for NonOS SDK (CMake not supported)
-- code: added 18 section dividers throughout `extension.js` for easier navigation
+## [1.0.4]
+- Partition Editor: TYPE and SUBTYPE columns fixed to same width with `min/max-width`
 
-## [1.8.9]
-- Utilities: added **Add Component** command (later moved to Project Folder in 1.9.0)
+## [1.0.3]
+- Partition Editor: all 4 data columns set to 50px; subtype set to 100px
 
-## [1.8.8]
-- Build commands: auto-save all unsaved files before build (`saveAll`)
-- Partition Editor: fixed Default preset — factory size now always capped at 0xF0000 (960KB) due to ESP8266 1MB app boundary hardware limit
+## [1.0.2]
+- Partition Editor: TYPE and SUBTYPE columns set to equal width (80px)
 
-## [1.8.7]
-- Published to VS Code Marketplace
-- Added GitHub repository: https://github.com/Dzantemir/esp8266-esp8285-Tools
-- Added README.md and CHANGELOG.md
-- Partition Editor: renamed "Default table" → "Default preset"
-- Partition Editor: OTA and SPIFFS presets now replace all partitions instantly
-- Partition Editor: improved SPIFFS preset layout — 512KB app + rest for SPIFFS
-- Partition Editor: fixed `window.confirm()` blocking in VSCode webview
+## [1.0.1]
+- Partition Editor: column widths adjusted
 
-## [1.8.6]
-- Partition Editor: merged two OTA preset buttons into one adaptive button
-  - Auto-switches label between "OTA preset (1MB)" and "OTA preset (2MB+)"
-- Partition Editor: replaced "NVS+FAT preset" with "SPIFFS preset"
-- Partition Editor: renamed "Refresh Settings From sdkconfig" → "Refresh From Menuconfig"
-- Partition Editor: inline warning banner for preset conflicts (auto-dismiss 7s)
+## [1.0.0]
+- Partition Editor: column widths rebalanced
 
-## [1.8.5]
-- Partition Editor: fixed hex offset formatting (0x09000 → 0x9000)
-- Partition Editor: OTA 2MB+ button disables when flash < 2MB
-- Partition Editor: NVS+FAT preset now includes FAT storage partition
+## [0.9.99]
+- Sidebar: removed terminal size warning from Reconfigure tooltip
 
-## [1.8.4]
-- Sidebar: moved eFuse/OTA commands to "⚗️ Advanced (Experimental)" group
-- Sidebar: group tooltip warns that eFuse writes are irreversible
+## [0.9.98]
+- Sidebar: added idf.py command descriptions to all tooltips
 
-## [1.8.3]
-- Validation: check for missing partition CSV before running idf.py
-- Added "Reset Config" — deletes sdkconfig and sdkconfig.old
+## [0.9.97]
+- Sidebar: `Open Monitor` renamed to `Monitor` in all menus
 
-## [1.8.2]
-- Partition Editor: enforced singleton panel
+## [0.9.96]
+- Build: post-build Flash and Flash App now use same settings as sidebar Flash/Flash App buttons
+- Build: COM port checked before build starts when post-build flash is selected
 
-## [1.8.1]
-- Fixed global busy lock not releasing after non-build commands
+## [0.9.95]
+- Build: COM port check added for Flash action in Step 3/3
 
-## [1.8.0]
-- Added global busy state — prevents parallel command execution
-- Status bar shows active command with spinner
+## [0.9.94]
+- Build: COM port check added for Flash App action in Step 3/3
 
-## [1.7.3]
-- Initial public release
-- ESP8266_RTOS_SDK (idf.py) support: build, flash, monitor, menuconfig, clean
-- ESP8266_NonOS_SDK (make) support: build, flash, monitor
-- Visual Partition Table Editor
-- SPIFFS image creation via mkspiffs
-- IntelliSense and tasks.json generation
-- Project creation wizard
+## [0.9.93]
+- Build: Step 3/3 — replaced `Flash & Monitor` with `Flash App`
+
+## [0.9.92]
+- README updated
+
+## [0.9.91]
+- manifest: added GitHub repository, issues and homepage links
+
+## [0.9.90]
+- Partition Editor: Save now re-reads CSV filename on each save (picks up sdkconfig changes)
+
+## [0.9.89]
+- Partition Editor: delete button repositioned to right edge with 15px margin
+
+## [0.9.88]
+- Partition Editor: delete button always red
+
+## [0.9.87]
+- Partition Editor: equal padding on delete button
+
+## [0.9.86]
+- Partition Editor: subtype column 100px
+
+## [0.9.85]
+- Partition Editor: column widths rebalanced
+
+## [0.9.84]
+- Partition Editor: spacing between size button and delete button
+
+## [0.9.83]
+- Partition Editor: CSV filename in subtitle now updates on Refresh
+- Partition Editor: subtitle and Refresh tooltip updated from `sdkconfig` to `Projectconfig`
+
+## [0.9.82]
+- Partition Editor: removed ENCRYPT column
+
+## [0.9.81]
+- Sidebar: Flash App configure menu — removed `Erase before flash` step (unsafe for app-only flash)
+
+## [0.9.80]
+- Sidebar: removed configure button from Flash App
+
+## [0.9.79]
+- Sidebar: removed configure button (`≡`) from Flash Bootloader and Flash Part. Table
+
+## [0.9.78]
+- Partition Editor: fixed drag-and-drop — drag only from handle `⠿`, fixed `dragleave` flicker
+
+## [0.9.77]
+- Make SPIFFS: removed output folder picker — always saves to project folder with folder name as filename
+
+## [0.9.76]
+- Make SPIFFS: dialog opens at project folder; empty folder warning removed
+
+## [0.9.75]
+- Make SPIFFS: system decides initial folder for dialog
+
+## [0.9.74]
+- Make SPIFFS: image size formula `× 2 + 4096`, minimum 4 blocks
+
+## [0.9.73]
+- Make SPIFFS: image size multiplier 1.25×
+
+## [0.9.72]
+- Make SPIFFS: image size multiplier 1.5×
+
+## [0.9.71]
+- Make SPIFFS: image size multiplier 2×
+
+## [0.9.70]
+- Make SPIFFS: fixed image size calculation (minimum 4 blocks, proper overhead)
+
+## [0.9.69]
+- Make SPIFFS: new flow — folder picker, size warning, output location choice
+
+## [0.9.68]
+- Make SPIFFS: dynamic image size from folder content; removed spiffsSize/Block/Page settings
+
+## [0.9.67]
+- Sidebar: `Reset sdkconfig` → `Reset Projectconfig`
+- Partition Editor: `Refresh from sdkconfig` → `Refresh from Projectconfig`
+
+## [0.9.66]
+- Partition Editor: removed OTA preset button
+
+## [0.9.65]
+- Sidebar: `Tool Path Settings` → `Python Path Settings`
