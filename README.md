@@ -13,7 +13,7 @@ Supports **ESP8266_RTOS_SDK** via `idf.py`.
 - **Build Bootloader** — bootloader only
 - **Build Partition Table** — partition table only
 - Auto-saves all unsaved files before build
-- Pre-build action: none / clean / full clean (Build only)
+- Pre-build action: none / clean / full clean
 - Post-build action: none / flash / flash app
 - Optional post-build analysis: size / size-components / size-files
 - COM port verified before build when post-build flash is selected
@@ -24,14 +24,18 @@ Supports **ESP8266_RTOS_SDK** via `idf.py`.
 - **Flash Bootloader** — flash bootloader only
 - **Flash Partition Table** — flash partition table only
 - **Erase Flash** — full flash erase
-- Configurable erase before flash (Flash only)
+- Configurable erase before flash
 - Configurable action after flash: none / monitor
 - Port availability check before flashing
+- If `build/flasher_args.json` is missing — automatically runs `reconfigure` first, then flash
 
 ### 🖥️ Monitor
 - **Monitor** — toggles between start/stop (button changes state)
 - Status bar shows Monitor button — red when running
 - Configurable baud rate
+- When terminal is killed (trash icon) — monitor state resets automatically
+- Flash + Monitor runs as two separate `idf.py` calls: flash completes first, then monitor starts
+- Monitor button activates only when monitor actually starts (not during flash)
 
 ### 🔧 SDK Configure
 - **Menuconfig** — visual configuration (`idf.py menuconfig`)
@@ -39,11 +43,15 @@ Supports **ESP8266_RTOS_SDK** via `idf.py`.
 - **Reset Projectconfig** — delete `sdkconfig` and restore defaults on next build
 
 ### 📁 Project Folder
-- Shows active project name with ✏️ edit button (edits `main/CMakeLists.txt`)
-- **📦 Components** — always visible, lists `components/` subfolders
-  - `[+]` button — **Create New Component** wizard
-  - `[✏️]` button — edit component
-  - `[🗑]` button — delete component
+- Shows active project name
+- **✏️** edit button — edits `main/CMakeLists.txt` (visible only when folder is selected)
+- **✕** clear button — releases active project folder (visible only when folder is selected)
+- Project folder selection always shows QuickPick menu — no auto-selection
+- Cleared folder state persists across VS Code restarts
+- **📦 Components** — lists `components/` subfolders
+  - `[+]` — Create New Component wizard
+  - `[✏️]` — edit component
+  - `[🗑]` — delete component
 
 ### ➕ Create New Component Wizard
 4 steps: name → source files → header location → REQUIRES dependencies
@@ -52,34 +60,43 @@ Supports **ESP8266_RTOS_SDK** via `idf.py`.
 4 steps: parent folder → project name → header location → REQUIRES dependencies  
 Generates `CMakeLists.txt`, `main.c`, header stub.
 
-### 🛠️ Utilities
-- **Make SPIFFS** — pack any folder into a SPIFFS binary image using `mkspiffs`
-  - Opens folder picker (defaults to project root)
-  - Calculates image size automatically (`folder size × 2 + 4096`, min 16 KB)
-  - Warns if image exceeds project flash size
-  - Saves `<foldername>.bin` to project root
-  - `mkspiffs` installed automatically if not found
-- **Custom Partitions** — open partition table editor
+### 🛠️ Make SPIFFS
+Pack any folder into a SPIFFS binary image using the bundled `spiffsgen.py` script.
+
+- Opens folder picker (defaults to project root)
+- **Image size**: Auto (minimum size calculated by spiffsgen.py) or manual input (bytes / KB / hex)
+- All SPIFFS parameters read from `sdkconfig` automatically:
+  - `CONFIG_SPIFFS_PAGE_SIZE` → `--page-size`
+  - `CONFIG_WL_SECTOR_SIZE` → `--block-size`
+  - `CONFIG_SPIFFS_OBJ_NAME_LEN` → `--obj-name-len`
+  - `CONFIG_SPIFFS_META_LENGTH` → `--meta-len`
+  - `CONFIG_SPIFFS_USE_MAGIC` → `--use-magic` / `--no-magic`
+  - `CONFIG_SPIFFS_USE_MAGIC_LENGTH` → `--use-magic-len` / `--no-magic-len`
+- `--aligned-obj-ix-tables` always enabled (required for ESP8266)
+- Checks Python → SDK folder → project folder before running
+- Saves `<foldername>.bin` to project root
 
 > ### 🗂️ Partition Table Editor
 >
-> Visual editor for ESP8266 flash partition tables.
-> Drag-and-drop reordering, flash map visualization, presets, validation and auto-patching.
+> Visual editor for ESP8266 flash partition tables — drag-and-drop, flash map, validation, bin linking.
 >
 > - Drag-and-drop partition reordering (drag handle `⠿`)
 > - Flash map visualization
 > - **Default Partition** — standard single factory app layout
 > - **Auto Offsets** — automatic offset recalculation from PT end
-> - Reads PT offset, flash size and CSV filename from `sdkconfig` automatically
-> - **Link to bin** — link any `.bin` file to a partition
+> - Reads PT offset, flash size and CSV filename from `sdkconfig`
+> - **Link to bin** — available only for `fat` and `spiffs` subtypes
+>   - When a bin file is linked — SIZE is set automatically to match file size (rounded to 4096)
+>   - SIZE field becomes read-only while a bin is linked
+>   - On open — bin file sizes silently re-checked and SIZE updated if file changed
+>   - On **Refresh** — bin file sizes re-checked, partitions updated, missing files unlinked
+>   - On save — bin file checked against available area; save blocked if file is too large
 > - Unsaved changes warning on close
 > - New partitions get unique names automatically
-> - Validation: alignment, overlaps, name length, duplicate names, custom subtype range (0x00–0xFE)
+> - Validation: alignment, overlaps, name length, duplicate names, custom subtype range
 > - TYPE: `app` / `data` / `custom…` (hex subtype 0x00–0xFE)
 > - DATA subtypes: `nvs`, `ota`, `phy`, `fat`, `spiffs`
 > - APP subtypes: `factory`, `ota_0`, `ota_1`
-
-
 
 ### 📊 Analysis
 - **Size** — firmware size report
@@ -88,6 +105,8 @@ Generates `CMakeLists.txt`, `main.c`, header stub.
 
 ### 🔧 VSCode Utilities
 - **Generate IntelliSense** — creates `.vscode/c_cpp_properties.json`
+  - Uses `compile_commands.json` as primary source (most accurate for Xtensa)
+  - No `intelliSenseMode` override — C/C++ extension auto-detects from compile commands
 - **Generate tasks.json** — adds ESP build tasks for `Ctrl+Shift+B`
 
 ### 📊 Status Bar
@@ -107,8 +126,9 @@ Quick access buttons: **Build** → **Flash** → **Clean** → **Monitor** → 
 1. Install the extension
 2. Set SDK path — click **RTOS IDF: not set** in sidebar
 3. Install build tools — extension installs automatically via `idf_tools.py`
-4. Select COM port via **Serial Source Settings → Port**
-5. Run **Build** → **Flash** → **Monitor**
+4. Select project folder — click **Project Folder → folder not found** in sidebar
+5. Select COM port via **Serial Source Settings → Port**
+6. Run **Build** → **Flash** → **Monitor**
 
 ---
 
@@ -126,7 +146,7 @@ Quick access buttons: **Build** → **Flash** → **Clean** → **Monitor** → 
 | `esp-idf-tools.monitorBaud` | Monitor baud rate | `74880` |
 | `esp-idf-tools.eraseBeforeFlash` | Erase flash before flashing | `false` |
 | `esp-idf-tools.postFlashAction` | After flash: `none` / `monitor` | `none` |
-| `esp-idf-tools.postBuildAction` | After build: `none` / `flash` / `app_flash` | `none` |
+| `esp-idf-tools.postBuildAction` — After build: `none` / `flash` / `app_flash` | `none` |
 | `esp-idf-tools.useCompressedUpload` | Compressed upload (`-z`) | `true` |
 | `esp-idf-tools.overrideFlashConfig` | Use manual flash settings | `false` |
 | `esp-idf-tools.reuseTerminal` | Reuse existing terminal | `true` |

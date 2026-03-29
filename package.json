@@ -2,7 +2,7 @@
   "name": "esp-idf-tools",
   "displayName": "ESP8266 / ESP8285 Tools",
   "description": "Build, flash, monitor and configure ESP8266/ESP8285 projects using ESP8266_RTOS_SDK (idf.py). Supports Windows, Linux and macOS.",
-  "version": "1.6.1",
+  "version": "1.8.6",
   "publisher": "Dzantemir",
   "author": "Dzantemir",
   "license": "MIT",
@@ -301,6 +301,11 @@
         "icon": "$(edit)"
       },
       {
+        "command": "esp.clearProject",
+        "title": "ESP › Clear Project Folder",
+        "icon": "$(close)"
+      },
+      {
         "command": "esp.configureBuildSimple",
         "title": "ESP › Configure Build",
         "icon": "$(list-unordered)"
@@ -350,8 +355,13 @@
         },
         {
           "command": "esp.editProject",
-          "when": "view == esp-idf-tools.projectView && viewItem == projectFolderGroup",
-          "group": "inline"
+          "when": "view == esp-idf-tools.projectView && viewItem == projectFolderGroupActive",
+          "group": "inline@1"
+        },
+        {
+          "command": "esp.clearProject",
+          "when": "view == esp-idf-tools.projectView && viewItem == projectFolderGroupActive",
+          "group": "inline@2"
         },
         {
           "command": "esp.configureBuildSimple",

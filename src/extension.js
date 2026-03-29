@@ -31,9 +31,7 @@ let _statusBarClean   = null;      // StatusBarItem — clean button
 let _monitorRunning   = false;     // true while monitor terminal is active
 let _globalBusy       = false;     // true while ANY command is running
 let _globalBusyName   = '';        // name of running command (for messages)
-let _provider         = null;      // TreeDataProvider — for sidebar refresh
 let provider          = null;      // EspProvider instance (set in activate)
-let _partitionPanels  = new Set(); // open Partition Editor panels
 let _partitionPanel   = null;      // singleton — only one editor at a time
 let _pushSdkconfigUpdate = null;   // callback — auto-refresh partition editor after menuconfig
 
@@ -342,7 +340,7 @@ function getToolsPlatform() {
 // ╔══════════════════════════════════════════════════════════════════╗
 // ║  RTOS SDK: idf.py runner                                           ║
 // ╚══════════════════════════════════════════════════════════════════╝
-async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {}) {
+async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {}, chainArgs = null, onChainStart = null) {
     // Block if another command is already running
     if (checkBusy()) return;
 
@@ -453,10 +451,51 @@ async function runIdf(args, termName, isBuildCommand = false, extraEnvVars = {})
     const markerSuffix2 = buildMarkerCmd(markerFile2);
     watchCommandDone(markerFile2, termName).finally(() => clearBusy());
 
-    if (IS_WIN) {
-        t.sendText(`Set-Location ${q(root)}; ${envPrefix}; ${extraEnvCmd}${idfCmd}${markerSuffix2}`);
+    // If chainArgs provided — run a second idf.py call after the first succeeds
+    const idfCmd2 = chainArgs ? makeIdfCmd(chainArgs) : null;
+
+    if (idfCmd2 && onChainStart) {
+        // Write a chain-start marker just before the second command so we can
+        // fire onChainStart (e.g. flip monitor button) at the right moment
+        const chainMarker = path.join(os.tmpdir(), `esp_chain_${Date.now()}.tmp`);
+        const chainStarted = Date.now();
+        const CHAIN_TIMEOUT = 30 * 60 * 1000; // 30 min — same as watchCommandDone
+
+        const chainTimer = setInterval(() => {
+            // Stop polling if terminal closed or timed out — flash failed
+            const termGone = !t || t.exitStatus !== undefined;
+            const timedOut = Date.now() - chainStarted > CHAIN_TIMEOUT;
+            if (termGone || timedOut) {
+                clearInterval(chainTimer);
+                try { fs.unlinkSync(chainMarker); } catch {}
+                return;
+            }
+            if (fs.existsSync(chainMarker)) {
+                clearInterval(chainTimer);
+                try { fs.unlinkSync(chainMarker); } catch {}
+                onChainStart();
+            }
+        }, 400);
+
+        const writeChainMarker = IS_WIN
+            ? `'0' | Out-File -NoNewline -Encoding ASCII ${q(chainMarker)}`
+            : `echo 0 > ${q(chainMarker)}`;
+
+        if (IS_WIN) {
+            const second = `; if ($LASTEXITCODE -eq 0) { ${writeChainMarker}; ${idfCmd2} }`;
+            t.sendText(`Set-Location ${q(root)}; ${envPrefix}; ${extraEnvCmd}${idfCmd}${second}${markerSuffix2}`);
+        } else {
+            const second = ` && ${writeChainMarker} && ${idfCmd2}`;
+            t.sendText(`cd ${q(root)} && ${envPrefix} && ${extraEnvCmd}${idfCmd}${second}${markerSuffix2}`);
+        }
     } else {
-        t.sendText(`cd ${q(root)} && ${envPrefix} && ${extraEnvCmd}${idfCmd}${markerSuffix2}`);
+        if (IS_WIN) {
+            const second = idfCmd2 ? `; if ($LASTEXITCODE -eq 0) { ${idfCmd2} }` : '';
+            t.sendText(`Set-Location ${q(root)}; ${envPrefix}; ${extraEnvCmd}${idfCmd}${second}${markerSuffix2}`);
+        } else {
+            const second = idfCmd2 ? ` && ${idfCmd2}` : '';
+            t.sendText(`cd ${q(root)} && ${envPrefix} && ${extraEnvCmd}${idfCmd}${second}${markerSuffix2}`);
+        }
     }
 }
 
@@ -547,7 +586,7 @@ async function runFlash(action = 'flash', eraseFirst = false) {
 
     const isMonitor  = action.endsWith('_monitor');
     const baseAction = isMonitor ? action.replace('_monitor', '') : action;
-    let args  =[];
+    let args  = [];
     let title = '';
 
     if (baseAction === 'monitor') {
@@ -559,28 +598,50 @@ async function runFlash(action = 'flash', eraseFirst = false) {
         }
         title = 'ESP › Monitor';
     } else {
-        // eraseFirst → idf.py erase_flash flash (single call, no delays)
-        args  = eraseFirst
+        // erase_flash + flash → always combined in one idf.py call
+        args = eraseFirst
             ? [...flashArgs, 'erase_flash', baseAction]
             : [...flashArgs, baseAction];
         const humanAction = baseAction.replace(/-/g, ' ').replace(/_/g, ' ');
         title = `ESP › ${eraseFirst ? 'Erase & ' : ''}${humanAction.charAt(0).toUpperCase() + humanAction.slice(1)}`;
 
         if (isMonitor) {
-            args.push('monitor');
-            if (overrideFlash) {
-                extraEnvVars.MONITORBAUD = String(cfg('monitorBaud') || 74880);
-            }
             title += ' & Monitor';
         }
     }
 
-    if (isMonitor || baseAction === 'monitor') {
+    if (baseAction === 'monitor') {
+        // Standalone monitor — flip button immediately
         _monitorRunning = true;
         refreshMonitorButton();
     }
 
-    await runIdf(args, title, false, extraEnvVars);
+    // Monitor always runs as a separate idf.py call after flash completes
+    let monitorChainArgs = null;
+    let onChainStart = null;
+    if (isMonitor) {
+        const monitorBaud = cfg('monitorBaud') || 74880;
+        monitorChainArgs = port
+            ? ['-p', port, '-b', String(monitorBaud), 'monitor']
+            : ['monitor'];
+        // Flip monitor button only when flash is done and monitor actually starts
+        onChainStart = () => { _monitorRunning = true; refreshMonitorButton(); };
+    }
+
+    // ── Check flasher_args.json — idf.py erase_flash / flash needs it ────────
+    // If missing, run reconfigure first (generates build files), then flash/erase.
+    // Note: monitor chain is dropped in this case — user can run it manually after.
+    const flasherArgsJson = path.join(rootFlash, 'build', 'flasher_args.json');
+    if (!fs.existsSync(flasherArgsJson) && baseAction !== 'monitor') {
+        vscode.window.showInformationMessage(
+            'ESP: build/flasher_args.json not found — running reconfigure first.'
+        );
+        await runIdf(['reconfigure'], `ESP › Reconfigure → ${title.replace('ESP › ','')}`,
+            false, {}, args, onChainStart);
+        return;
+    }
+
+    await runIdf(args, title, false, extraEnvVars, monitorChainArgs, onChainStart);
 }
 
 async function runWithPostFlash(action) {
@@ -862,91 +923,9 @@ async function checkToolsOrPrompt(idfPath, pythonCmd) {
     });
 }
 
-// ─── Find mkspiffs binary in ~/.espressif/tools/mkspiffs/ ────────────────────
-function getMkspiffsCmd() {
-    const espressifBase = path.join(os.homedir(), '.espressif', 'tools', 'mkspiffs');
-    if (!fs.existsSync(espressifBase)) return null;
-    const versions = fs.readdirSync(espressifBase).filter(v =>
-        fs.statSync(path.join(espressifBase, v)).isDirectory()
-    );
-    if (!versions.length) return null;
-    const versionDir = path.join(espressifBase, versions[0]);
-    const exe = IS_WIN ? 'mkspiffs.exe' : 'mkspiffs';
-    // Check direct location first, then one level of subdirectory
-    const direct = path.join(versionDir, exe);
-    if (fs.existsSync(direct)) return direct;
-    for (const sub of fs.readdirSync(versionDir)) {
-        const subPath = path.join(versionDir, sub, exe);
-        if (fs.existsSync(subPath)) return subPath;
-    }
-    return null;
-}
-
-function patchToolsJson(idfPath) {
-    const toolsJsonPath = path.join(idfPath, 'tools', 'tools.json');
-    if (!fs.existsSync(toolsJsonPath)) return;
-
-    let toolsJson;
-    try { toolsJson = JSON.parse(fs.readFileSync(toolsJsonPath, 'utf8')); }
-    catch { return; }
-
-    // Already patched?
-    if (toolsJson.tools.some(t => t.name === 'mkspiffs')) return;
-
-    const mkspiffsEntry = {
-        description: "Tool to create SPIFFS images",
-        export_paths: [[""]],
-        export_vars: {},
-        info_url: "https://github.com/igrr/mkspiffs",
-        install: "on_request",
-        license: "MIT",
-        name: "mkspiffs",
-        platform_overrides: [
-            {
-                install: "always",
-                export_paths: [["mkspiffs-0.2.3-esp-idf-win32"]],
-                platforms: ["win32", "win64"]
-            }
-        ],
-        version_cmd: ["mkspiffs", "--version"],
-        version_regex: "mkspiffs ver\\.\\s*([0-9.]+)",
-        versions: [{
-            name: "0.2.3",
-            status: "recommended",
-            "win32": {
-                sha256: "deaf940e58da4d51337b1df071c38647f9e1ea35bcf14ce7004e246175f37c9e",
-                size: 249820,
-                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-win32.zip"
-            },
-            "win64": {
-                sha256: "deaf940e58da4d51337b1df071c38647f9e1ea35bcf14ce7004e246175f37c9e",
-                size: 249820,
-                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-win32.zip"
-            },
-            "linux-amd64": {
-                sha256: "aa56bd38a65b3de6c68468f5ea9d7f8d207b319a549e3fc59946b2b7e984c9d9",
-                size: 50635,
-                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-linux64.tar.gz"
-            },
-            "linux-i686": {
-                sha256: "d01bac03912bb21b9f96a609e88400ce4803607f80353fc8dfc52d471c1c5a88",
-                size: 48739,
-                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-linux32.tar.gz"
-            },
-            "macos": {
-                sha256: "0dc927b30759130c82943141d7fa06afab0f75fbccbf43d51b498485610945c8",
-                size: 130245,
-                url: "https://github.com/igrr/mkspiffs/releases/download/0.2.3/mkspiffs-0.2.3-esp-idf-osx.tar.gz"
-            }
-        }]
-    };
-
-    toolsJson.tools.push(mkspiffsEntry);
-
-    try {
-        fs.writeFileSync(toolsJsonPath, JSON.stringify(toolsJson, null, 2), 'utf8');
-    } catch (e) {
-    }
+// ─── Resolve bundled spiffsgen.py path ───────────────────────────────────────
+function getSpiffsgenScript() {
+    return path.join(globalCtx.extensionPath, 'scripts', 'spiffsgen.py');
 }
 
 // ─── Check python deps before each command ───────────────────────────────────
@@ -1179,7 +1158,7 @@ function refreshMonitorButton() {
         _statusBarMonitor.backgroundColor = undefined;
     }
     _statusBarMonitor.show();
-    if (_provider) _provider.refresh();
+    if (provider) provider.refresh();
 }
 
 function refreshStatusBar() {
@@ -1517,7 +1496,7 @@ class EspProvider {
                 return [ compGroup ];
             })() )
         ]);
-        projectGroup.contextValue = 'projectFolderGroup';
+        projectGroup.contextValue = root ? 'projectFolderGroupActive' : 'projectFolderGroup';
 
         const createProjectItem = new EspItem('Create New Project', {
             command: 'esp.createProject',
@@ -1679,21 +1658,31 @@ class EspProvider {
 function activate(ctx) {
     globalCtx = ctx;
     provider = new EspProvider();
-    _provider = provider;
 
     const folders   = vscode.workspace.workspaceFolders;
     const savedRoot = ctx.workspaceState.get('espActiveRoot');
+    // savedRoot === null means user explicitly cleared — don't auto-restore
+    // savedRoot === undefined means first launch — don't auto-pick either
     if (savedRoot && folders?.find(f => f.uri.fsPath === savedRoot)) {
         activeRoot = savedRoot;
-    } else if (folders?.length) {
-        activeRoot = folders[0].uri.fsPath;
-        ctx.workspaceState.update('espActiveRoot', activeRoot);
     }
 
     ctx.subscriptions.push(
         vscode.window.onDidCloseTerminal(closed => {
             for (const [name, t] of Object.entries(terms)) {
-                if (t === closed) { delete terms[name]; log(`Terminal closed: "${name}"`); break; }
+                if (t === closed) {
+                    delete terms[name];
+                    log(`Terminal closed: "${name}"`);
+                    // If the closed terminal was a monitor terminal — reset state
+                    const monitorTermNames = ['ESP › Monitor', 'ESP › Flash & Monitor', 'ESP › flash monitor & Monitor'];
+                    if (monitorTermNames.includes(name)) {
+                        _monitorRunning = false;
+                        clearBusy();
+                        refreshMonitorButton();
+                        log(`Monitor terminal killed — state reset`);
+                    }
+                    break;
+                }
             }
         })
     );
@@ -1780,6 +1769,12 @@ function activate(ctx) {
 
     reg('esp.createProject',  async () => { await cmdCreateProject();  provider.refresh(); });
     reg('esp.editProject',    async () => { await cmdEditProject();    provider.refresh(); });
+    reg('esp.clearProject',   () => {
+        activeRoot = null;
+        if (globalCtx) globalCtx.workspaceState.update('espActiveRoot', null);
+        provider.refresh();
+        refreshStatusBar();
+    });
     reg('esp.selectPort',     async () => { const p = await cmdSelectPort();  provider.refresh(); refreshStatusBar(); return p; });
     reg('esp.selectIdf',      async () => { await cmdFixSdk(true);  provider.refresh(); refreshStatusBar(); });
     reg('esp.selectProject',  async () => { await cmdSelectProject();  provider.refresh(); });
@@ -1876,9 +1871,6 @@ async function autoGenerateDevFiles() {
                     compileCommands: compileCommandsPath,
                     cStandard: 'gnu11',
                     cppStandard: 'gnu++14',
-                    intelliSenseMode: compilerPath
-                        ? (IS_WIN ? 'windows-gcc-arm' : IS_MAC ? 'macos-gcc-arm' : 'linux-gcc-arm')
-                        : '${default}',
                     browse: {
                         path:['${workspaceFolder}', idfPath],
                         limitSymbolsToIncludedHeaders: true
@@ -1958,23 +1950,6 @@ function checkDialoutGroup() {
 
 function getActiveRoot() {
     if (activeRoot && fs.existsSync(activeRoot)) return activeRoot;
-    const ed = vscode.window.activeTextEditor;
-    if (ed) {
-        const wf = vscode.workspace.getWorkspaceFolder(ed.document.uri);
-        if (wf && fs.existsSync(wf.uri.fsPath)) {
-            activeRoot = wf.uri.fsPath;
-            if (globalCtx) globalCtx.workspaceState.update('espActiveRoot', activeRoot);
-            return activeRoot;
-        }
-    }
-    const folders = vscode.workspace.workspaceFolders ||[];
-    if (folders.length > 0 && fs.existsSync(folders[0].uri.fsPath)) {
-        activeRoot = folders[0].uri.fsPath;
-        if (globalCtx) globalCtx.workspaceState.update('espActiveRoot', activeRoot);
-        return activeRoot;
-    }
-    activeRoot = null;
-    if (globalCtx) globalCtx.workspaceState.update('espActiveRoot', null);
     return null;
 }
 
@@ -2008,9 +1983,6 @@ async function cmdGenerateIntelliSense() {
             compileCommands: compileCommandsPath,
             cStandard: 'gnu11',
             cppStandard: 'gnu++14',
-            intelliSenseMode: compilerPath
-                ? (IS_WIN ? 'windows-gcc-arm' : IS_MAC ? 'macos-gcc-arm' : 'linux-gcc-arm')
-                : '${default}',
             browse: {
                 path: ['${workspaceFolder}', idfPath],
                 limitSymbolsToIncludedHeaders: true
@@ -2604,12 +2576,6 @@ async function cmdSelectProject() {
         vscode.commands.executeCommand('workbench.action.files.openFolder');
         return;
     }
-    if (folders.length === 1) {
-        activeRoot = folders[0].uri.fsPath;
-        if (globalCtx) globalCtx.workspaceState.update('espActiveRoot', activeRoot);
-        vscode.window.showInformationMessage(`ESP: Project → ${path.basename(activeRoot)}`);
-        return;
-    }
     const items = folders.map(f => ({
         label: path.basename(f.uri.fsPath),
         description: f.uri.fsPath,
@@ -2970,42 +2936,33 @@ function detectPortsMac() {
 // ║  UTILITIES: SPIFFS, Partition CSV, Reset Config                    ║
 // ╚══════════════════════════════════════════════════════════════════╝
 async function cmdMakeSpiffs() {
-    const root = getActiveRoot();
-    if (!await requireReady()) return;
+    // ── 1. Check Python
+    const pythonCmd = await getPythonCmd();
+    if (!pythonCmd) return; // getPythonCmd() already showed the error
 
-    // ── 1. Check mkspiffs FIRST
-    const mkspiffsCmd = getMkspiffsCmd();
-    if (!mkspiffsCmd) {
-        const idfPath = getValidIdfPath();
-        if (!idfPath) {
-            const ans = await vscode.window.showErrorMessage(
-                'mkspiffs requires ESP8266 RTOS SDK to be configured. Set up SDK first.',
-                'Set up SDK'
-            );
-            if (ans === 'Set up SDK') vscode.commands.executeCommand('esp.selectIdf');
-            return;
-        }
-        const pythonCmd = await getPythonCmd();
-        if (!pythonCmd) return;
-        patchToolsJson(idfPath);
-        const ans = await vscode.window.showWarningMessage(
-            'mkspiffs not found. Install it automatically?', 'Install', 'Cancel'
+    // ── 2. Check SDK folder
+    const idfPath = getValidIdfPath();
+    if (!idfPath) {
+        const ans = await vscode.window.showErrorMessage(
+            'ESP SPIFFS: ESP8266 RTOS SDK not found. Set up SDK first.',
+            'Set up SDK'
         );
-        if (ans !== 'Install') return;
-        const idfToolsPy = path.join(idfPath, 'tools', 'idf_tools.py');
-        const t = getTerm('ESP › Install mkspiffs');
-        t.show(true);
-        setBusy('Installing mkspiffs');
-        const markerFile = path.join(os.tmpdir(), `esp_mkspiffs_${Date.now()}.tmp`);
-        t.sendText(`${pythonCmd} ${q(idfToolsPy)} install mkspiffs` + buildMarkerCmd(markerFile));
-        watchCommandDone(markerFile, 'ESP › Install mkspiffs').then(() => {
-            clearBusy();
-            vscode.window.showInformationMessage('✅ mkspiffs installed! Run Make SPIFFS again.');
-        });
+        if (ans === 'Set up SDK') vscode.commands.executeCommand('esp.selectIdf');
         return;
     }
 
-    // ── 2. Select source folder
+    // ── 3. Check active project folder
+    const root = getActiveRoot();
+    if (!root) { warnNoProject(); return; }
+    if (!fs.existsSync(path.join(root, 'CMakeLists.txt')) && !fs.existsSync(path.join(root, 'sdkconfig'))) {
+        vscode.window.showErrorMessage('ESP SPIFFS: No CMakeLists.txt or sdkconfig found. Is this an ESP-IDF project?');
+        return;
+    }
+
+    // ── 4. Resolve bundled spiffsgen.py
+    const spiffsgenScript = getSpiffsgenScript();
+
+    // ── 5. Select source folder
     const folderUri = await vscode.window.showOpenDialog({
         canSelectFiles: false,
         canSelectFolders: true,
@@ -3017,60 +2974,103 @@ async function cmdMakeSpiffs() {
     if (!folderUri || !folderUri[0]) return;
     const dataDir = folderUri[0].fsPath;
 
-    // ── 3. Calculate folder size
-    const BLOCK = 4096;
+    // ── 6. Read SPIFFS parameters from sdkconfig
+    const sdkVal = (key, def) => getSdkconfigValue(root, key) || def;
 
-    // Get flash size from settings
-    const flashSizeStr = cfg('flashSize') || '2MB';
-    const flashSizeMap = { '512KB': 524288, '1MB': 1048576, '2MB': 2097152, '4MB': 4194304, '8MB': 8388608, '16MB': 16777216 };
-    const MAX_SIZE = flashSizeMap[flashSizeStr] || 2097152;
+    const pageSize   = sdkVal('CONFIG_SPIFFS_PAGE_SIZE',   '256');
+    const blockSize  = sdkVal('CONFIG_WL_SECTOR_SIZE',     '4096');
+    const objNameLen = sdkVal('CONFIG_SPIFFS_OBJ_NAME_LEN','32');
+    const metaLen    = sdkVal('CONFIG_SPIFFS_META_LENGTH',  '4');
+    const useMagic   = sdkVal('CONFIG_SPIFFS_USE_MAGIC',          'y') === 'y' ? '--use-magic'     : '--no-magic';
+    const useMagicLen= sdkVal('CONFIG_SPIFFS_USE_MAGIC_LENGTH',   'y') === 'y' ? '--use-magic-len' : '--no-magic-len';
 
-    function getFolderSize(dir) {
-        let total = 0;
-        try {
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const full = path.join(dir, entry.name);
-                if (entry.isDirectory()) total += getFolderSize(full);
-                else total += fs.statSync(full).size;
-            }
-        } catch { /* skip unreadable entries */ }
-        return total;
-    }
-
-    const dataSize = getFolderSize(dataDir);
-    log(`[spiffs] folder: ${dataDir} | size: ${dataSize} B (${(dataSize/1024).toFixed(1)} KB)`);
-
-    // ── 4. Calculate image size
-    // SPIFFS: dataSize * 2, rounded up to block (4096), + 1 extra block, minimum 4 blocks (16KB)
-    const MIN_BLOCKS = 4;
-    const blocksNeeded = dataSize > 0 ? Math.ceil((dataSize * 2) / BLOCK) + 1 : 0;
-    const size = Math.max(blocksNeeded, MIN_BLOCKS) * BLOCK;
-    log(`[spiffs] data: ${dataSize} B → image: ${size} B (${(size/1024).toFixed(1)} KB)`);
-
-    // ── 5. Warn if image size exceeds flash size
-    if (size > MAX_SIZE) {
-        const ans = await vscode.window.showWarningMessage(
-            `ESP SPIFFS: Image size (${(size/1024/1024).toFixed(2)} MB) exceeds total flash size (${flashSizeStr}). Reduce the number or size of files. Continue anyway?`,
-            'Continue', 'Cancel'
-        );
-        if (ans !== 'Continue') return;
-    }
+    log(`[spiffs] page=${pageSize} block=${blockSize} obj-name-len=${objNameLen} meta-len=${metaLen} ${useMagic} ${useMagicLen}`);
 
     // ── 7. Output: project folder, filename = selected folder name + .bin
     const outBin = path.join(root, path.basename(dataDir) + '.bin');
 
-    // ── 8. Run mkspiffs
+    // ── 8. Select image size — auto or manual
+    const flashSizeStr = sdkVal('CONFIG_ESPTOOLPY_FLASHSIZE', '2MB');
+    const flashSizeMap = { '256KB':262144, '512KB':524288, '1MB':1048576, '2MB':2097152, '4MB':4194304, '8MB':8388608, '16MB':16777216 };
+    const flashBytes   = flashSizeMap[flashSizeStr] || 2097152;
+    const BLOCK        = parseInt(blockSize) || 4096;
+
+    // Build preset size options aligned to block size
+    const presets = [64, 128, 256, 512, 1024, 2048, 4096]
+        .map(kb => kb * 1024)
+        .filter(b => b <= flashBytes && b % BLOCK === 0)
+        .map(b => ({
+            label: b >= 1048576 ? `${b/1048576} MB` : `${b/1024} KB`,
+            description: `${b} bytes (0x${b.toString(16).toUpperCase()})`,
+            bytes: b
+        }));
+
+    const sizeItems = [
+        {
+            label: '$(wand) Auto',
+            description: 'Let spiffsgen.py calculate the minimum required size',
+            bytes: null
+        },
+        ...presets,
+        {
+            label: '$(pencil) Enter manually...',
+            description: 'Type exact size in bytes, KB or hex (e.g. 65536 / 64K / 0x10000)',
+            bytes: 'manual'
+        }
+    ];
+
+    const pickedSize = await vscode.window.showQuickPick(sizeItems, {
+        title: 'SPIFFS: Select image size',
+        placeHolder: 'Auto — recommended if you are not sure'
+    });
+    if (!pickedSize) return;
+
+    let imageSizeArg = '';  // empty = auto mode
+    if (pickedSize.bytes === 'manual') {
+        const input = await vscode.window.showInputBox({
+            title: 'SPIFFS: Enter image size',
+            prompt: 'Bytes, KB or hex — e.g. 65536 or 64K or 0x10000',
+            placeHolder: '0x10000',
+            validateInput: v => {
+                v = v.trim();
+                const n = /^0[xX]/.test(v) ? parseInt(v, 16)
+                    : /^\d+[Kk]$/.test(v)   ? parseInt(v) * 1024
+                    : parseInt(v);
+                if (isNaN(n) || n <= 0)   return 'Enter a positive number';
+                if (n % BLOCK !== 0)       return `Size must be a multiple of block size (${BLOCK} bytes)`;
+                if (n > flashBytes)        return `Exceeds flash size (${flashSizeStr} = ${flashBytes} bytes)`;
+                return null;
+            }
+        });
+        if (!input) return;
+        const v = input.trim();
+        const n = /^0[xX]/.test(v) ? parseInt(v, 16)
+            : /^\d+[Kk]$/.test(v)   ? parseInt(v) * 1024
+            : parseInt(v);
+        imageSizeArg = String(n);
+    } else if (pickedSize.bytes !== null) {
+        imageSizeArg = String(pickedSize.bytes);
+    }
+
+    // ── 9. Run spiffsgen.py — image_size omitted = auto, or explicit bytes
     const t = getTerm('ESP › Make SPIFFS');
     t.show(true);
 
-    const mkcmd = q(mkspiffsCmd);
+    const pycmd = pythonCmd.replace(/^& /, '');
+    const spiffsArgs = `--page-size ${pageSize} --block-size ${blockSize} --obj-name-len ${objNameLen} --meta-len ${metaLen} ${useMagic} ${useMagicLen} --aligned-obj-ix-tables`;
+    // spiffsgen.py signature: [image_size] base_dir output_file [options]
+    // positional args must come before options
+    const positional = imageSizeArg
+        ? `${imageSizeArg} ${q(dataDir)} ${q(outBin)}`
+        : `${q(dataDir)} ${q(outBin)}`;
     const parts = IS_WIN
         ? [`Set-Location ${q(root)}`,
-           `& ${mkcmd} -d 5 -c ${q(dataDir)} -s ${size} -b ${BLOCK} -p 256 ${q(outBin)}`]
+           `& ${pycmd} ${q(spiffsgenScript)} ${positional} ${spiffsArgs}`]
         : [`cd ${q(root)}`,
-           `${mkcmd} -d 5 -c ${q(dataDir)} -s ${size} -b ${BLOCK} -p 256 ${q(outBin)}`];
+           `${pycmd} ${q(spiffsgenScript)} ${positional} ${spiffsArgs}`];
     t.sendText(buildCmd(parts));
-    vscode.window.showInformationMessage(`ESP SPIFFS: Building image (${(size/1024).toFixed(1)} KB) → ${path.basename(outBin)}`);
+    const sizeLabel = imageSizeArg ? `${(parseInt(imageSizeArg)/1024).toFixed(0)} KB` : 'auto size';
+    vscode.window.showInformationMessage(`ESP SPIFFS: Building image (${sizeLabel}) → ${path.basename(outBin)}`);
 }
 
 // Check if custom partition CSV is configured but missing on disk
@@ -3098,7 +3098,7 @@ async function checkPartitionCsv(root) {
 
 function getSdkconfigValue(root, key) {
     for (const fname of ['sdkconfig', 'sdkconfig.defaults']) {
-        const p = require('path').join(root, fname);
+        const p = path.join(root, fname);
         if (fs.existsSync(p)) {
             try {
                 const m = fs.readFileSync(p, 'utf8').match(new RegExp('^' + key + '=(.+)$', 'm'));
@@ -3223,6 +3223,35 @@ function cmdPartitionEditor() {
 
     panel.webview.html = getPartitionEditorHtml(existingCsv, csvFilename, ptOffsetVal, flashSizeVal, _restoredLinks);
 
+    // ── Silently fix bin file sizes on open ───────────────────────────────────
+    // If a linked bin file changed size outside VS Code since last save,
+    // update the partition SIZE right away without asking the user.
+    if (_restoredLinks.length > 0) {
+        const BLOCK_OPEN = 4096;
+        const _csvLinesOpen = existingCsv.replace(/\r\n/g, '\n').split('\n')
+            .filter(l => l.trim() && !l.trim().startsWith('#'));
+        const _sizeUpdates = [];
+        _restoredLinks.forEach((binPath, i) => {
+            if (!binPath) return;
+            try {
+                const fileSize   = fs.statSync(binPath).size;
+                const newSize    = Math.ceil(fileSize / BLOCK_OPEN) * BLOCK_OPEN;
+                const parts      = (_csvLinesOpen[i] || '').split(',').map(s => s.trim());
+                const currentSz  = parseInt(parts[3] || '0', 16) || parseInt(parts[3] || '0');
+                if (newSize !== currentSz && newSize > 0) {
+                    _sizeUpdates.push({ index: i, fileSize, newSize });
+                    log(`[partitions] open: updated size for index ${i}: ${currentSz} → ${newSize}`);
+                }
+            } catch { /* file missing — leave as-is, user will see it on Refresh */ }
+        });
+        if (_sizeUpdates.length > 0) {
+            // Small delay so webview is ready to receive messages
+            setTimeout(() => {
+                panel.webview.postMessage({ command: 'applySizeUpdatesOnOpen', updates: _sizeUpdates });
+            }, 300);
+        }
+    }
+
     let _lastSavedLinks = _restoredLinks.length ? JSON.parse(JSON.stringify(_restoredLinks)) : null;
 
     // Helper: patch CMakeLists.txt with bin links
@@ -3255,13 +3284,6 @@ function cmdPartitionEditor() {
 
         if (msg.command === 'setDirty') { _panelIsDirty = msg.dirty; return; }
 
-        if (msg.command === 'warnLinkSize') {
-            vscode.window.showWarningMessage(
-                `ESP: Linked file "${msg.fileName}" (${(msg.fileSize/1024).toFixed(1)} KB) exceeds new partition size (${(msg.partSize/1024).toFixed(1)} KB).`
-            );
-            return;
-        }
-
         if (msg.command === 'linkBin') {
             vscode.window.showOpenDialog({
                 canSelectFiles: true, canSelectFolders: false, canSelectMany: false,
@@ -3270,26 +3292,87 @@ function cmdPartitionEditor() {
             }).then(uris => {
                 if (!uris || !uris[0]) return;
                 const binPath = uris[0].fsPath;
-                try {
-                    const fileSize = fs.statSync(binPath).size;
-                    const partSize = msg.partitionSize;
-                    if (partSize && fileSize > partSize) {
-                        vscode.window.showWarningMessage(
-                            `ESP: File size (${(fileSize/1024).toFixed(1)} KB) exceeds partition size (${(partSize/1024).toFixed(1)} KB). Link anyway?`,
-                            'Link anyway', 'Cancel'
-                        ).then(ans => {
-                            if (ans === 'Link anyway') panel.webview.postMessage({ command: 'setBinLink', index: msg.index, binPath, fileSize });
-                        });
-                    } else {
-                        panel.webview.postMessage({ command: 'setBinLink', index: msg.index, binPath, fileSize });
-                    }
-                } catch {
-                    panel.webview.postMessage({ command: 'setBinLink', index: msg.index, binPath, fileSize: 0 });
+                let fileSize = 0;
+                try { fileSize = fs.statSync(binPath).size; } catch { }
+
+                const BLOCK = 4096;
+                // Round file size up to block boundary
+                const requiredSize = Math.ceil(fileSize / BLOCK) * BLOCK;
+
+                // ── Calculate free space at the target partition's position ──
+                const idx        = msg.index;
+                const parts      = msg.partitions || [];
+                const flashSize  = msg.flashSize  || 1048576;
+
+                const parseHex = s => {
+                    if (!s) return NaN;
+                    s = String(s).trim().replace(/_/g, '');
+                    if (/^0[xX]/.test(s)) return parseInt(s, 16);
+                    const m = s.match(/^(\d+(?:\.\d+)?)\s*([KkMm]?)$/);
+                    if (!m) return NaN;
+                    const n = parseFloat(m[1]);
+                    return Math.floor(m[2].toUpperCase() === 'K' ? n*1024 : m[2].toUpperCase() === 'M' ? n*1048576 : n);
+                };
+
+                const thisOffset = parseHex(parts[idx]?.offset);
+
+                // Find the start of the next partition after idx (or end of flash)
+                let nextStart = flashSize;
+                parts.forEach((p, j) => {
+                    if (j === idx) return;
+                    const off = parseHex(p.offset);
+                    if (!isNaN(off) && off > thisOffset) nextStart = Math.min(nextStart, off);
+                });
+
+                const freeBytes = isNaN(thisOffset) ? flashSize : nextStart - thisOffset;
+
+                if (requiredSize > freeBytes) {
+                    vscode.window.showErrorMessage(
+                        `ESP: File "${path.basename(binPath)}" requires ${(requiredSize/1024).toFixed(1)} KB ` +
+                        `but only ${(freeBytes/1024).toFixed(1)} KB is available for this partition. Operation cancelled.`
+                    );
+                    return;
                 }
+
+                // All good — set SIZE to requiredSize and link the file
+                panel.webview.postMessage({ command: 'setBinLink', index: idx, binPath, fileSize, newSize: requiredSize });
             });
         }
 
         if (msg.command === 'save') {
+            // ── Check bin file sizes before writing ───────────────────────────
+            const BLOCK_SAVE = 4096;
+            const flashBytesStr = getSdkconfigValue(root, 'CONFIG_ESPTOOLPY_FLASHSIZE') || '2MB';
+            const flashBytesMap = { '512KB':524288,'1MB':1048576,'2MB':2097152,'4MB':4194304,
+                                    '512K':524288,'1M':1048576,'2M':2097152,'4M':4194304 };
+            const flashTotal = flashBytesMap[flashBytesStr] || 2097152;
+            const csvPartitions = (msg.csv || '').split('\n')
+                .filter(l => l.trim() && !l.trim().startsWith('#'))
+                .map(l => { const p = l.split(',').map(s => s.trim()); return { name: p[0], offset: parseInt(p[3], 16) || 0 }; });
+            const sizeErrors = (msg.binLinks || []).map((binPath, i) => {
+                if (!binPath) return null;
+                try {
+                    const fileSize  = fs.statSync(binPath).size;
+                    const required  = Math.ceil(fileSize / BLOCK_SAVE) * BLOCK_SAVE;
+                    const part      = csvPartitions[i];
+                    if (!part) return null;
+                    const nextStart = csvPartitions
+                        .filter((p, j) => j !== i && p.offset > part.offset)
+                        .reduce((min, p) => Math.min(min, p.offset), flashTotal);
+                    const freeArea  = nextStart - part.offset;
+                    if (required > freeArea) {
+                        return `"${path.basename(binPath)}" (${(required/1024).toFixed(0)} KB) exceeds free area of "${part.name}" (${(freeArea/1024).toFixed(0)} KB)`;
+                    }
+                } catch { return null; }
+                return null;
+            }).filter(Boolean);
+            if (sizeErrors.length > 0) {
+                vscode.window.showErrorMessage(
+                    `ESP: Bin file too large — ${sizeErrors.join('; ')}. Resize the partition first.`
+                );
+                return;
+            }
+            // ─────────────────────────────────────────────────────────────────
             try {
                 fs.writeFileSync(currentCsvPath, msg.csv, 'utf8');
                 const linksChanged = JSON.stringify(msg.binLinks) !== JSON.stringify(_lastSavedLinks);
@@ -3299,7 +3382,7 @@ function cmdPartitionEditor() {
                 const isCustomPt = getSdkconfigValue(root, 'CONFIG_PARTITION_TABLE_CUSTOM') === 'y';
                 if (linksChanged && isCustomPt) runIdf(['reconfigure'], 'ESP › Reconfigure', false);
             } catch (e) {
-                vscode.window.showErrorMessage(`ESP: Failed to save CSV: \${e.message}`);
+                vscode.window.showErrorMessage(`ESP: Failed to save CSV: ${e.message}`);
             }
         }
         if (msg.command === 'saveWithErrors') {
@@ -3332,6 +3415,13 @@ function cmdPartitionEditor() {
             );
         }
         if (msg.command === 'refresh') { pushSdkconfigUpdate(); }
+
+        if (msg.command === 'binSizeWarnings') {
+            vscode.window.showInformationMessage(
+                `ESP Partitions: ${msg.warnings.join(' | ')}`
+            );
+            return;
+        }
     });
 
     // Free panel resources when user closes the tab
@@ -3342,10 +3432,31 @@ function cmdPartitionEditor() {
                                '512K':'524288','1M':'1048576','2M':'2097152','4M':'4194304' };
         const newFlashSize = (newFlashRaw && flashSizeMap[newFlashRaw]) ? flashSizeMap[newFlashRaw] : '1048576';
         const newCsvFilename = getPartitionCsvFilename(root);
-        panel.webview.postMessage({ command: 'sdkconfigUpdate', ptOffset: newPtOffset, flashSize: newFlashSize, csvFilename: newCsvFilename });
+
+        // Re-check sizes of all linked bin files — user may have changed them outside VS Code
+        // Returns array of { index, fileSize, newSize (rounded to block), warning? }
+        const BLOCK = 4096;
+        const binSizeUpdates = (_lastSavedLinks || []).map((binPath, i) => {
+            if (!binPath) return null;
+            try {
+                const fileSize = fs.statSync(binPath).size;
+                const newSize  = Math.ceil(fileSize / BLOCK) * BLOCK;
+                return { index: i, fileSize, newSize };
+            } catch {
+                // File no longer exists
+                return { index: i, fileSize: 0, newSize: 0, missing: true };
+            }
+        }).filter(Boolean);
+
+        panel.webview.postMessage({
+            command: 'sdkconfigUpdate',
+            ptOffset: newPtOffset,
+            flashSize: newFlashSize,
+            csvFilename: newCsvFilename,
+            binSizeUpdates
+        });
     }
     _partitionPanel = panel;
-    _partitionPanels.add(panel);
     _pushSdkconfigUpdate = pushSdkconfigUpdate; // expose for auto-refresh after menuconfig
     let _panelIsDirty = false;
 
@@ -3363,7 +3474,6 @@ function cmdPartitionEditor() {
                 'ESP Partition Editor was closed with unsaved changes.'
             );
         }
-        _partitionPanels.delete(panel);
         _partitionPanel = null;
         _pushSdkconfigUpdate = null;
     }, null, []);
@@ -3797,16 +3907,18 @@ function renderTable() {
       </td>
       <td class="col-size">
         <div class="hex-wrap">
-          <input id="szIn\${i}" value="\${p.size}" oninput="update(\${i},'size',this.value)" placeholder="0x6000" />
-          <button class="dd-btn" onclick="toggleDd(this,'sz',\${i})" tabindex="-1" title="Show size suggestions">▾</button>
+          <input id="szIn\${i}" value="\${p.size}" oninput="update(\${i},'size',this.value)" placeholder="0x6000"
+            \${binLinks[i] ? 'readonly title="Size is controlled by the linked .bin file" style="opacity:0.5;cursor:not-allowed"' : ''} />
+          \${binLinks[i] ? '' : \`<button class="dd-btn" onclick="toggleDd(this,'sz',\${i})" tabindex="-1" title="Show size suggestions">▾</button>\`}
         </div>
         <span class="size-hint" id="sh\${i}"></span>
       </td>
-
       <td class="col-link">
-        \${binLinks[i]
-          ? \`<span title="\${binLinks[i]}"><button class="link-clear" onclick="clearLink(\${i})" title="Remove link" style="margin-right:6px">✕</button><button class="link-btn linked" onclick="linkBin(\${i})" title="\${binLinks[i]}">\${binLinks[i].replace(/\\\\/g,'/').split('/').pop()}</button></span>\`
-          : \`<button class="link-btn" onclick="linkBin(\${i})" title="Link a .bin file to this partition">+ Link bin</button>\`
+        \${(['fat','spiffs'].includes(p.subtype))
+          ? (binLinks[i]
+              ? \`<span title="\${binLinks[i]}"><button class="link-clear" onclick="clearLink(\${i})" title="Remove link" style="margin-right:6px">✕</button><button class="link-btn linked" onclick="linkBin(\${i})" title="\${binLinks[i]}">\${binLinks[i].replace(/\\\\/g,'/').split('/').pop()}</button></span>\`
+              : \`<button class="link-btn" onclick="linkBin(\${i})" title="Link a .bin file to this partition">+ Link bin</button>\`)
+          : ''
         }
       </td>
       <td class="col-del">
@@ -3954,24 +4066,23 @@ function update(i, field, value) {
   setDirty();
 
   if (field === 'size' && binLinks[i] && binFileSizes[i]) {
-    const newSize = parseSize(value);
-    if (!isNaN(newSize) && newSize > 0 && binFileSizes[i] > newSize) {
-      vscode.postMessage({
-        command: 'warnLinkSize',
-        fileName: binLinks[i].replace(/\\\\/g, '/').split('/').pop(),
-        fileSize: binFileSizes[i],
-        partSize: newSize
-      });
-    }
+    // Size changed manually — just re-render, bin link stays
   }
 
   if (field === 'type') {
     if (value === 'app')  partitions[i].subtype = 'factory';
     else if (value === 'data') partitions[i].subtype = 'nvs';
     else partitions[i].subtype = '0x00';
-    renderTable(); 
+    // Clear link — new subtype is not fat/spiffs
+    binLinks[i] = null; binFileSizes[i] = 0;
+    renderTable();
   }
-  
+
+  if (field === 'subtype' && !['fat','spiffs'].includes(value)) {
+    // Clear link when switching away from fat/spiffs
+    if (binLinks[i]) { binLinks[i] = null; binFileSizes[i] = 0; }
+  }
+
   updateOnlyStatusAndMap();
 }
 
@@ -4015,7 +4126,9 @@ function toCsv() {
 }
 
 function linkBin(i) {
-  vscode.postMessage({ command: 'linkBin', index: i, partitionSize: parseSize(partitions[i].size), partitionOffset: partitions[i].offset });
+  const flashSizeEl = document.getElementById('flashSizeSel');
+  const flashSizeVal = flashSizeEl ? parseInt(flashSizeEl.value || '1048576') : 1048576;
+  vscode.postMessage({ command: 'linkBin', index: i, partitions: partitions, flashSize: flashSizeVal });
 }
 function clearLink(i) {
   binLinks[i] = null;
@@ -4054,9 +4167,25 @@ window.addEventListener('message', e => {
     }
     return;
   }
+  if (msg.command === 'applySizeUpdatesOnOpen') {
+    msg.updates.forEach(u => {
+      if (partitions[u.index]) {
+        partitions[u.index].size = '0x' + u.newSize.toString(16).toUpperCase();
+        binFileSizes[u.index] = u.fileSize;
+      }
+    });
+    setDirty();
+    render();
+    return;
+  }
+
   if (msg.command === 'setBinLink') {
     binLinks[msg.index] = msg.binPath;
     binFileSizes[msg.index] = msg.fileSize || 0;
+    // Auto-adjust partition SIZE to match the bin file (rounded up to 4096)
+    if (msg.newSize && msg.newSize > 0) {
+      partitions[msg.index].size = '0x' + msg.newSize.toString(16).toUpperCase();
+    }
     setDirty();
     render();
     return;
@@ -4067,10 +4196,34 @@ window.addEventListener('message', e => {
   const fsEl  = document.getElementById('flashSizeSel');
   const fsDis = document.getElementById('flashSizeDisplay');
   if (fsEl) { fsEl.value = msg.flashSize; }
-  const fsLabels = {'524288':'512\\u202fKB','1048576':'1\\u202fMB','2097152':'2\\u202fMB','4194304':'4\\u202fMB'};
+  const fsLabels = {'524288':'512\u202fKB','1048576':'1\u202fMB','2097152':'2\u202fMB','4194304':'4\u202fMB'};
   if (fsDis) fsDis.textContent = fsLabels[msg.flashSize] || msg.flashSize + ' B';
   const csvEl = document.getElementById('csvFilenameLabel');
   if (csvEl && msg.csvFilename) csvEl.textContent = msg.csvFilename;
+
+  // Apply bin file size updates — re-check files changed outside VS Code
+  if (msg.binSizeUpdates && msg.binSizeUpdates.length > 0) {
+    const warnings = [];
+    msg.binSizeUpdates.forEach(u => {
+      if (u.missing) {
+        warnings.push(\`Linked file for partition #\${u.index + 1} no longer exists — link removed.\`);
+        binLinks[u.index] = null;
+        binFileSizes[u.index] = 0;
+        return;
+      }
+      const prevSize = parseSize(partitions[u.index]?.size || '0');
+      if (u.newSize !== prevSize) {
+        binFileSizes[u.index] = u.fileSize;
+        partitions[u.index].size = '0x' + u.newSize.toString(16).toUpperCase();
+        warnings.push(\`Partition "\${partitions[u.index]?.name}": size updated to \${(u.newSize/1024).toFixed(0)} KB to match linked bin file.\`);
+      }
+    });
+    if (warnings.length > 0) {
+      vscode.postMessage({ command: 'binSizeWarnings', warnings });
+      setDirty();
+    }
+  }
+
   render();
 });
 
